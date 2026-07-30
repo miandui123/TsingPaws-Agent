@@ -1,0 +1,247 @@
+#!/bin/sh /etc/rc.common
+
+#
+# TsingPaw Web Launcher — OpenWrt/FriendlyWrt procd service
+#
+# Install dir (default): /opt/tsingpaw/current
+# Optional override: /etc/tsingpaw.conf with TSINGPAW_DIR=/opt/tsingpaw/current
+#
+# Install:
+#   cp tsingpaw /etc/init.d/tsingpaw && chmod +x /etc/init.d/tsingpaw
+#   /etc/init.d/tsingpaw enable && /etc/init.d/tsingpaw start
+#
+# Access info: cat /opt/tsingpaw-access.txt
+#
+
+USE_PROCD=1
+START=99
+STOP=10
+
+NAME=tsingpaw
+
+LAUNCHER_BIN="picoclaw-launcher"
+DEVICE_GUARD_LIB="/lib/functions/device-guard.sh"
+
+TSINGPAW_DIR_DEFAULT="/opt/tsingpaw/current"
+ACCESS_FILE="${TSINGPAW_ACCESS_FILE:-/opt/tsingpaw-access.txt}"
+
+[ -r "$DEVICE_GUARD_LIB" ] && . "$DEVICE_GUARD_LIB"
+
+[ -f /etc/tsingpaw.conf ] && . /etc/tsingpaw.conf
+
+HTTP_PORT="${TSINGPAW_HTTP_PORT:-18800}"
+LAUNCHER_PORT_FILE="${TSINGPAW_LAUNCHER_PORT_FILE:-/var/run/tsingpaw-launcher.port}"
+
+PICOCLAW_HOME_RES="${PICOCLAW_HOME:-/opt/tsingpaw/data}"
+PICOCLAW_WORKSPACE_RES="${PICOCLAW_WORKSPACE:-$PICOCLAW_HOME_RES/workspace}"
+
+resolve_tz() {
+	if [ -n "${TZ:-}" ]; then
+		echo "$TZ"
+		return
+	fi
+
+	if command -v uci >/dev/null 2>&1; then
+		_tz="$(uci -q get system.@system[0].zonename 2>/dev/null)"
+		if [ -n "$_tz" ]; then
+			echo "$_tz"
+			return
+		fi
+	fi
+
+	if [ -r /etc/TZ ]; then
+		_tz="$(tr -d '\r\n' </etc/TZ 2>/dev/null)"
+		if [ -n "$_tz" ]; then
+			echo "$_tz"
+			return
+		fi
+	fi
+
+	if command -v uci >/dev/null 2>&1; then
+		_tz="$(uci -q get system.@system[0].timezone 2>/dev/null)"
+		[ -n "$_tz" ] && echo "$_tz"
+	fi
+}
+
+TZ_RES="$(resolve_tz)"
+
+EXTRA_CMD_ARGS="-console -no-browser"
+# TSINGPAW_PUBLIC=0 keeps launcher on localhost when fronted by tsingpaws-bridge
+[ "${TSINGPAW_PUBLIC:-1}" = "1" ] && EXTRA_CMD_ARGS="$EXTRA_CMD_ARGS -public"
+[ "$HTTP_PORT" != "18800" ] && EXTRA_CMD_ARGS="$EXTRA_CMD_ARGS -port $HTTP_PORT"
+
+uci_storage_value() {
+	_key="$1"
+	_default="$2"
+	_value=$(uci -q get "tsingpaw-updater.main.${_key}" 2>/dev/null || true)
+	[ -n "$_value" ] && echo "$_value" || echo "$_default"
+}
+
+maintain_runtime_storage() {
+	_log="/opt/tsingpaw/updater/logs/updater.log"
+	_max_kb=$(uci_storage_value log_max_kb 512)
+	_days=$(uci_storage_value download_max_age_days 1)
+	_keep=$(uci_storage_value keep_data_backups 3)
+
+	case "$_max_kb" in ''|*[!0-9]*) _max_kb=512 ;; esac
+	case "$_days" in ''|*[!0-9]*) _days=1 ;; esac
+	case "$_keep" in ''|*[!0-9]*) _keep=3 ;; esac
+
+	if [ "$_max_kb" -gt 0 ] && [ -f "$_log" ]; then
+		_size=$(wc -c <"$_log" 2>/dev/null || echo 0)
+		case "$_size" in ''|*[!0-9]*) _size=0 ;; esac
+		if [ "$_size" -ge $((_max_kb * 1024)) ]; then
+			rm -f "$_log.1"
+			mv "$_log" "$_log.1"
+		fi
+	fi
+
+	if [ "$_days" -gt 0 ] && [ -d /opt/tsingpaw/downloads ]; then
+		_age=$((_days * 1440))
+		find /opt/tsingpaw/downloads -type f -mmin "+$_age" -exec rm -f {} \; 2>/dev/null || true
+	fi
+
+	_seen=0
+	if [ -d "$PICOCLAW_HOME_RES/backups" ]; then
+		for _entry in $(ls -1dt "$PICOCLAW_HOME_RES"/backups/* 2>/dev/null || true); do
+			_seen=$((_seen + 1))
+			[ "$_seen" -le "$_keep" ] || rm -rf "$_entry"
+		done
+	fi
+}
+
+resolve_tsingpaw_dir() {
+	_try="$1"
+
+	if [ -n "$_try" ] && [ -x "$_try/$LAUNCHER_BIN" ]; then
+		echo "$_try"
+		return 0
+	fi
+
+	for d in \
+		"$TSINGPAW_DIR_DEFAULT" \
+		"/opt/tsingpaw/current" \
+		"/opt/tsingpaw" \
+		"/root/tsingpaw-arm" \
+		"/root/TsingPaw" \
+		"/root/tsingpaw" \
+		"/root/tsingpaw-arm64" \
+		"/usr/local/tsingpaw"
+	do
+		if [ -x "$d/$LAUNCHER_BIN" ]; then
+			echo "$d"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+tsingpaw_lan_ip() {
+	ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	[ -n "$ip" ] && echo "$ip" && return
+
+	ip=$(ip -4 -br addr show br-lan 2>/dev/null | awk '{print $3}' | cut -d/ -f1 | head -1)
+	[ -n "$ip" ] && echo "$ip" && return
+
+	ip=$(ip -4 addr show 2>/dev/null | awk '/inet / && $2 !~ /^127\./ {print $2}' | cut -d/ -f1 | head -1)
+	[ -n "$ip" ] && echo "$ip" && return
+
+	echo "127.0.0.1"
+}
+
+write_access_info() {
+	TSINGPAW_DIR_RES="$1"
+
+	(
+		i=0
+
+		while [ "$i" -lt 30 ]; do
+			ip=$(tsingpaw_lan_ip)
+
+			[ -n "$ip" ] && [ "$ip" != "127.0.0.1" ] && break
+
+			i=$((i + 1))
+			sleep 2
+		done
+
+		[ -z "$ip" ] && ip=$(tsingpaw_lan_ip)
+
+		{
+			echo "TsingPaw Web UI: http://${ip}:${HTTP_PORT}"
+			echo "Gateway API health: http://${ip}:18790/health"
+			echo "Install dir: ${TSINGPAW_DIR_RES}"
+			echo "Launcher: ${LAUNCHER_BIN}"
+			echo "Updated: $(date 2>/dev/null)"
+		} >"$ACCESS_FILE"
+
+		logger -t tsingpaw "Web UI http://${ip}:${HTTP_PORT} dir=${TSINGPAW_DIR_RES}"
+	) &
+}
+
+stop_protected_tsingpaw_processes() {
+	killall picoclaw-launcher >/dev/null 2>&1 || true
+	killall picoclaw >/dev/null 2>&1 || true
+}
+
+device_guard_allow_start() {
+	if ! command -v device_guard_verify >/dev/null 2>&1; then
+		logger -t tsingpaw "ERROR: missing $DEVICE_GUARD_LIB, refusing to start"
+		stop_protected_tsingpaw_processes
+		return 1
+	fi
+
+	if ! device_guard_verify; then
+		logger -t tsingpaw "ERROR: device fingerprint mismatch, refusing to start"
+		stop_protected_tsingpaw_processes
+		return 1
+	fi
+
+	return 0
+}
+
+start_service() {
+	device_guard_allow_start || return 1
+	maintain_runtime_storage
+
+	TSINGPAW_DIR_RES=$(resolve_tsingpaw_dir "${TSINGPAW_DIR:-}")
+
+	if [ -z "$TSINGPAW_DIR_RES" ]; then
+		logger -t tsingpaw "ERROR: cannot find $LAUNCHER_BIN. Set TSINGPAW_DIR in /etc/tsingpaw.conf or put binaries under $TSINGPAW_DIR_DEFAULT"
+		echo "tsingpaw: missing $LAUNCHER_BIN. Please configure /etc/tsingpaw.conf" >>"$ACCESS_FILE"
+		return 1
+	fi
+
+	PROG="$TSINGPAW_DIR_RES/$LAUNCHER_BIN"
+
+	if [ ! -x "$PROG" ]; then
+		logger -t tsingpaw "ERROR: not executable: $PROG"
+		return 1
+	fi
+
+	write_access_info "$TSINGPAW_DIR_RES"
+	mkdir -p "$(dirname "$LAUNCHER_PORT_FILE")"
+	printf '%s\n' "$HTTP_PORT" >"${LAUNCHER_PORT_FILE}.new"
+	mv -f "${LAUNCHER_PORT_FILE}.new" "$LAUNCHER_PORT_FILE"
+
+	procd_open_instance
+	procd_set_param command "$PROG" $EXTRA_CMD_ARGS
+	# Keep all environment values in one procd table. Repeating
+	# procd_set_param env replaces the previous table on OpenWrt.
+	procd_set_param env \
+		TSINGPAW_DIR="$TSINGPAW_DIR_RES" \
+		TZ="$TZ_RES" \
+		HOME="/root" \
+		PICOCLAW_HOME="$PICOCLAW_HOME_RES" \
+		PICOCLAW_WORKSPACE="$PICOCLAW_WORKSPACE_RES" \
+		PICOCLAW_DOWNLOADS_DIR="/opt/tsingpaw/downloads" \
+		PICOCLAW_TOOLS_DOWNLOADS_DIR="/opt/tsingpaw/downloads"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	:
+}
