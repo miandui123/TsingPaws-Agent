@@ -895,6 +895,7 @@ class Agent:
         self.binding_checked_at = 0.0
         self.last_session_id: str = load_last_session_id()
         self.ack_capable_sessions: Set[str] = set()
+        self.ignored_inbound_transfers: Set[str] = set()
         self.transfers = xfer.TransferManager(
             workspace=pico_workspace(),
             send_error=self._transfer_error_cb,
@@ -1140,6 +1141,92 @@ class Agent:
 
     def _message_outbox_dir(self) -> str:
         return os.path.join(conf_dir(), "message-outbox")
+
+    def _inbound_receipt_dir(self) -> str:
+        return os.path.join(conf_dir(), "inbound-receipts")
+
+    def _inbound_receipt_path(self, kind: str, delivery_id: str) -> Optional[str]:
+        if kind not in ("message", "file"):
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{8,200}", delivery_id):
+            return None
+        return os.path.join(
+            self._inbound_receipt_dir(),
+            f"{kind}-{delivery_id}.json",
+        )
+
+    def _has_inbound_receipt(self, kind: str, delivery_id: str) -> bool:
+        path = self._inbound_receipt_path(kind, delivery_id)
+        if path is None:
+            return False
+        try:
+            if time.time() - os.path.getmtime(path) > 7 * 24 * 60 * 60:
+                os.unlink(path)
+                return False
+            return os.path.isfile(path)
+        except OSError:
+            return False
+
+    def _record_inbound_receipt(
+        self,
+        kind: str,
+        delivery_id: str,
+        session_id: str,
+    ) -> None:
+        path = self._inbound_receipt_path(kind, delivery_id)
+        if path is None:
+            return
+        directory = self._inbound_receipt_dir()
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "kind": kind,
+                        "delivery_id": delivery_id,
+                        "session_id": session_id,
+                        "completed_at": int(time.time()),
+                    },
+                    fh,
+                    ensure_ascii=False,
+                )
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        receipts = sorted(
+            glob.glob(os.path.join(directory, "*.json")),
+            key=lambda item: os.path.getmtime(item),
+        )
+        for stale in receipts[:-2000]:
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+
+    async def _ack_app_message(self, session_id: str, message_id: str) -> None:
+        await self.send_to_app(
+            make_envelope(
+                MESSAGE_ACK_TYPE,
+                session_id,
+                {"message_id": message_id},
+            )
+        )
+
+    async def _ack_app_file(self, session_id: str, transfer_id: str) -> None:
+        await self.send_to_app(
+            make_envelope(
+                FILE_ACK_TYPE,
+                session_id,
+                {"transfer_id": transfer_id},
+            )
+        )
 
     def _queue_outbound_message(self, envelope: Dict[str, Any]) -> None:
         message_id = str(envelope.get("id") or "")
@@ -1437,9 +1524,26 @@ class Agent:
                 return
 
             if kind == "message.send":
+                request_payload = (
+                    obj.get("payload")
+                    if isinstance(obj.get("payload"), dict)
+                    else {}
+                )
+                message_id = str(
+                    request_payload.get("message_id") or obj.get("id") or ""
+                )
+                if self._has_inbound_receipt("message", message_id):
+                    await self._ack_app_message(session_id, message_id)
+                    return
                 try:
                     await self.begin_session_task(session_id)
                     await self.forward_to_pico(session_id, message)
+                    self._record_inbound_receipt(
+                        "message",
+                        message_id,
+                        session_id,
+                    )
+                    await self._ack_app_message(session_id, message_id)
                 except asyncio.CancelledError:
                     await self._typing_stop_force(session_id)
                     self.clear_session_busy(session_id)
@@ -1479,12 +1583,29 @@ class Agent:
         transfer_id = payload.get("transfer_id") if isinstance(payload.get("transfer_id"), str) else None
         try:
             if kind == "file.start":
+                if transfer_id and self._has_inbound_receipt("file", transfer_id):
+                    self.ignored_inbound_transfers.add(transfer_id)
+                    return
+                if transfer_id and self.transfers.get(transfer_id) is not None:
+                    self.transfers.cleanup_transfer(transfer_id)
                 self.transfers.handle_start(session_id, payload)
             elif kind == "file.chunk":
+                if transfer_id in self.ignored_inbound_transfers:
+                    return
                 self.transfers.handle_chunk(session_id, payload)
             elif kind == "file.end":
+                if transfer_id in self.ignored_inbound_transfers:
+                    self.ignored_inbound_transfers.discard(transfer_id)
+                    await self._ack_app_file(session_id, transfer_id)
+                    return
                 completed = self.transfers.handle_end(session_id, payload)
                 await self._after_inbound_file(completed)
+                self._record_inbound_receipt(
+                    "file",
+                    completed.transfer_id,
+                    session_id,
+                )
+                await self._ack_app_file(session_id, completed.transfer_id)
         except xfer.TransferError as exc:
             log.warning(
                 "transfer error code=%s session=%s transfer=%s",
