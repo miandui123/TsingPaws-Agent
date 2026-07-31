@@ -259,5 +259,16 @@ def test_relay_health_accepts_auth_variant(monkeypatch):
     assert body["version"] == "internal-test-auth-1"
 
 
+def test_relay_health_accepts_sync_variant(monkeypatch):
+    def fake_http(method, url, payload=None, bearer=None, timeout=10.0):
+        return 200, {"version": "internal-test-sync-1", "pairing_flow": "app_first_invitation"}, {}
+
+    monkeypatch.setattr(ag, "http_json", fake_http)
+    monkeypatch.setenv("RELAY_HTTP_BASE", "http://127.0.0.1:9")
+    ok, body = ag.relay_health()
+    assert ok is True
+    assert body["version"] == "internal-test-sync-1"
+
+
 def test_agent_version_bumped():
-    assert ag.AGENT_VERSION == "2.1.1-filexfer"
+    assert ag.AGENT_VERSION == "2.3.0-binding-ui"

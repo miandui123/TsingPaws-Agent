@@ -275,8 +275,12 @@ def test_11_js_sanitize_and_submit_gate():
     js = (ROOT / "static" / "cloud-channel.js").read_text(encoding="utf-8")
     assert "生成/刷新配对码" not in js
     assert "查看配对二维码" not in js
-    assert "确认添加" in js
+    assert "确认绑定" in js
     assert "添加到 TsingPaws APP" in js
+    assert "一台 TsingPaws 同时只能绑定一个 APP 账号" in js
+    assert "一台小主机" not in js
+    assert "!status.bound" in js
+    assert "status.pairing_enabled" in js
     assert "localStorage.setItem" not in js
     assert "localStorage.getItem" not in js
     assert "history.pushState" in js or "popstate" in js
@@ -299,7 +303,6 @@ def test_11_js_sanitize_and_submit_gate():
     assert can_submit("583921", True, True) is False
     assert can_submit("583921", False, False) is False
     assert "refs.bind.disabled" in js
-    assert "status.registered" in js
 
 
 def test_14_bridge_loopback_guard():
@@ -324,3 +327,93 @@ def test_13_short_device_id():
     assert ag.short_device_id("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") == "aaaaaaaa…eeee"
     assert ag.short_device_id("home-001") == "home-001"
     assert ag.short_device_id(None) is None
+
+
+def test_15_status_request_is_local_and_correlated(conf, monkeypatch):
+    agent = ag.Agent()
+    captured = []
+
+    async def capture(obj):
+        captured.append(obj)
+
+    monkeypatch.setattr(agent, "send_to_app", capture)
+    monkeypatch.setattr(
+        agent,
+        "device_status_payload",
+        lambda: {"lan_ip": "192.168.100.12", "scheduled_tasks": []},
+    )
+    asyncio.run(
+        agent.handle_relay_message(
+            json.dumps(
+                {
+                    "type": "device.status.request",
+                    "id": "envelope-id",
+                    "session_id": "session-status-test",
+                    "payload": {"request_id": "request-123"},
+                }
+            )
+        )
+    )
+    assert len(captured) == 1
+    assert captured[0]["type"] == "device.status.response"
+    assert captured[0]["session_id"] == "session-status-test"
+    assert captured[0]["payload"]["request_id"] == "request-123"
+    assert captured[0]["payload"]["lan_ip"] == "192.168.100.12"
+
+
+def test_16_scheduled_tasks_reads_picoclaw_jobs(conf, monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    cron = workspace / "cron"
+    cron.mkdir(parents=True)
+    (cron / "jobs.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "jobs": [
+                    {
+                        "id": "job-1",
+                        "name": "每日汇报",
+                        "enabled": True,
+                        "schedule": {"kind": "every", "everyMs": 900000},
+                        "payload": {"message": "生成并发送汇报"},
+                        "state": {
+                            "lastRunAtMs": 123,
+                            "nextRunAtMs": 456,
+                            "lastStatus": "ok",
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PICO_WORKSPACE", str(workspace))
+    tasks = ag._scheduled_tasks()
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == "job-1"
+    assert tasks[0]["enabled"] is True
+    assert tasks[0]["every_ms"] == 900000
+    assert tasks[0]["last_status"] == "ok"
+
+
+def test_17_machine_lan_ip_prefers_configured_override(monkeypatch):
+    monkeypatch.setenv("LAN_IP_OVERRIDE", "192.168.100.211")
+
+    assert ag._machine_lan_ip() == "192.168.100.211"
+
+
+def test_18_pico_security_file_token_overrides_stale_env(monkeypatch, tmp_path):
+    security = tmp_path / ".security.yml"
+    security.write_text(
+        "channels:\n"
+        "  weixin:\n"
+        "    token: unrelated\n"
+        "  pico:\n"
+        "    token: 'current-pico-token'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PICO_SECURITY_FILE", str(security))
+    monkeypatch.setenv("PICO_TOKEN", "stale-pico-token")
+
+    assert ag.pico_token() == "current-pico-token"

@@ -14,7 +14,7 @@
 #
 
 USE_PROCD=1
-START=99
+START=97
 STOP=10
 
 NAME=tsingpaw
@@ -200,9 +200,43 @@ device_guard_allow_start() {
 	return 0
 }
 
+sync_pico_channel_token() {
+	[ -n "${PICOCLAW_CHANNELS_PICO_TOKEN:-}" ] || return 0
+	_config="${PICOCLAW_CONFIG:-$PICOCLAW_HOME_RES/config.json}"
+	[ -f "$_config" ] || return 0
+	PICOCLAW_CHANNELS_PICO_TOKEN="$PICOCLAW_CHANNELS_PICO_TOKEN" \
+		/usr/bin/python3 - "$_config" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+token = os.environ.get("PICOCLAW_CHANNELS_PICO_TOKEN", "")
+if not token:
+    raise SystemExit(0)
+with open(path, "r", encoding="utf-8") as handle:
+    document = json.load(handle)
+channels = document.setdefault("channels", {})
+pico = channels.setdefault("pico", {})
+if pico.get("token") == token:
+    raise SystemExit(0)
+pico["token"] = token
+temporary = path + ".tsingpaws-token.tmp"
+with open(temporary, "w", encoding="utf-8") as handle:
+    json.dump(document, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
+os.replace(temporary, path)
+PY
+}
+
 start_service() {
 	device_guard_allow_start || return 1
 	maintain_runtime_storage
+	sync_pico_channel_token
 
 	TSINGPAW_DIR_RES=$(resolve_tsingpaw_dir "${TSINGPAW_DIR:-}")
 
@@ -236,6 +270,10 @@ start_service() {
 		PICOCLAW_WORKSPACE="$PICOCLAW_WORKSPACE_RES" \
 		PICOCLAW_DOWNLOADS_DIR="/opt/tsingpaw/downloads" \
 		PICOCLAW_TOOLS_DOWNLOADS_DIR="/opt/tsingpaw/downloads"
+	if [ -n "${PICOCLAW_CHANNELS_PICO_TOKEN:-}" ]; then
+		procd_append_param env \
+			PICOCLAW_CHANNELS_PICO_TOKEN="$PICOCLAW_CHANNELS_PICO_TOKEN"
+	fi
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1
 	procd_set_param stderr 1

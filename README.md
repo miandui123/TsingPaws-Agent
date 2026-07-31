@@ -2,7 +2,7 @@
 
 当前默认以 `/etc/tsingpaws-agent/mode` 为准。内部测试版切换后为 `internal_test`。
 
-Agent `2.1.1-filexfer` 在保持 Relay↔PicoClaw 文本桥接的同时，拦截 APP `file.*` 做本地落盘与 Pico 通知，并把 Pico 附件/批准目录下的输出文件以 `file.*` 推回 APP；按 `session_id` 维护 typing / cancel，避免会话永久堵塞。
+Agent `2.3.0-binding-ui` 在保持 Relay↔PicoClaw 文本桥接的同时，拦截 APP `file.*` 做本地落盘与 Pico 通知，并把 Pico 附件/批准目录下的输出文件以 `file.*` 推回 APP；按 `session_id` 维护 typing / cancel，避免会话永久堵塞。
 
 ## Python 依赖
 

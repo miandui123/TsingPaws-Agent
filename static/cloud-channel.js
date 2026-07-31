@@ -37,6 +37,8 @@
   function serviceLabel(status) {
     if (!status?.agent_running) return ["服务未启动", "red"];
     if (status.config_error) return ["需要检查", "red"];
+    if (!status.binding_known) return ["确认状态", "gray"];
+    if (!status.bound) return ["等待绑定", "purple"];
     if (status.relay_connected && status.pico_reachable) return ["服务正常", "green"];
     if (status.relay_connecting) return ["正在连接", "orange"];
     return ["暂不可用", "gray"];
@@ -51,6 +53,11 @@
   async function claimPairing() {
     const refs = STATE.refs;
     const code = (refs.code.value || "").replace(/\D/g, "");
+    if (!STATE.status?.pairing_enabled) {
+      refs.result.textContent = STATE.status?.pairing_disabled_reason || "当前无法绑定";
+      refs.result.className = "tp-pair-result bad";
+      return;
+    }
     if (code.length !== 6 || STATE.busy) return;
     STATE.busy = true;
     refs.result.textContent = "正在绑定…";
@@ -75,21 +82,45 @@
     const root = el("div", { id: PANEL_ID, className: "tp-cloud-inline" });
     const refs = {};
     refs.badge = el("span", { className: "tp-badge gray", text: "检查中" });
-    root.appendChild(el("div", { className: "tp-cloud-hero" }, [
+    root.appendChild(el("header", { className: "tp-cloud-hero" }, [
       el("div", { className: "tp-cloud-hero-icon", text: "T" }),
-      el("div", {}, [el("h2", { text: "TsingPaws" }), el("p", { text: "连接手机 APP，随时使用您的小主机" })]),
+      el("div", { className: "tp-cloud-brand" }, [
+        el("span", { className: "tp-eyebrow", text: "TSINGPAWS CONNECT" }),
+        el("h2", { text: "连接您的 TsingPaws" }),
+        el("p", { text: "一个账号连接手机、电脑和 TsingPaws" }),
+      ]),
       refs.badge,
     ]));
 
+    refs.stateCard = el("section", { className: "tp-state-card loading" });
+    refs.stateIcon = el("div", { className: "tp-state-icon", text: "…" });
+    refs.stateTitle = el("h3", { text: "正在确认绑定状态" });
+    refs.stateDesc = el("p", { text: "请稍候，正在读取这台 TsingPaws 的连接信息。" });
+    refs.account = el("div", { className: "tp-account-chip" });
     refs.cloud = el("strong", { text: "检查中" });
     refs.assistant = el("strong", { text: "检查中" });
-    root.appendChild(el("section", { className: "tp-customer-card" }, [
-      el("h3", { text: "设备状态" }),
-      el("div", { className: "tp-status-grid" }, [
-        el("div", { className: "tp-status-item" }, [el("span", { text: "手机连接服务" }), refs.cloud]),
-        el("div", { className: "tp-status-item" }, [el("span", { text: "本机智能助手" }), refs.assistant]),
+    refs.health = el("div", { className: "tp-health-row" }, [
+      el("div", { className: "tp-health-item" }, [
+        el("span", { className: "tp-health-dot" }),
+        el("span", { text: "APP 连接" }),
+        refs.cloud,
       ]),
-    ]));
+      el("div", { className: "tp-health-item" }, [
+        el("span", { className: "tp-health-dot" }),
+        el("span", { text: "TsingPaws 助手" }),
+        refs.assistant,
+      ]),
+    ]);
+    refs.stateCard.append(
+      refs.stateIcon,
+      el("div", { className: "tp-state-copy" }, [
+        refs.stateTitle,
+        refs.stateDesc,
+        refs.account,
+        refs.health,
+      ]),
+    );
+    root.appendChild(refs.stateCard);
 
     refs.code = el("input", { className: "tp-code-input", inputmode: "numeric", maxlength: "6", placeholder: "六位绑定码", autocomplete: "one-time-code" });
     refs.code.addEventListener("input", () => {
@@ -97,15 +128,34 @@
       render();
     });
     refs.code.addEventListener("keydown", (event) => { if (event.key === "Enter") claimPairing(); });
-    refs.bind = el("button", { className: "primary", text: "确认添加", onClick: claimPairing });
+    refs.bind = el("button", { className: "primary", text: "确认绑定", onClick: claimPairing });
     refs.result = el("div", { className: "tp-pair-result" });
-    root.appendChild(el("section", { className: "tp-customer-card" }, [
-      el("h3", { text: "添加到 TsingPaws APP" }),
-      el("p", { className: "tp-pair-desc", text: "请先在 TsingPaws APP 中点击“添加 TsingPaws”，然后在这里输入 APP 显示的六位绑定码。" }),
+    refs.pairCard = el("section", { className: "tp-pair-card" });
+    refs.pairTitle = el("h3", { text: "添加到 TsingPaws APP" });
+    refs.pairDesc = el("p", {
+      className: "tp-pair-desc",
+      text: "在 APP 中选择“添加 TsingPaws”，然后输入 APP 显示的六位绑定码。",
+    });
+    refs.boundNotice = el("div", { className: "tp-bound-notice" });
+    refs.pairCard.append(
+      el("div", { className: "tp-section-heading" }, [
+        el("span", { className: "tp-step-number", text: "1" }),
+        el("div", {}, [
+          refs.pairTitle,
+          el("p", { text: "完成后，手机和电脑就能与这台 TsingPaws 对话" }),
+        ]),
+      ]),
+      refs.pairDesc,
+      el("label", { className: "tp-code-label", text: "六位绑定码" }),
       el("div", { className: "tp-pair-row" }, [refs.code, refs.bind]),
       refs.result,
-      el("p", { className: "tp-binding-rule", text: "一台小主机同时只能绑定一个 APP 账号。更换账号前，请先在原 APP 中解除绑定。" }),
-    ]));
+      refs.boundNotice,
+      el("div", { className: "tp-binding-rule" }, [
+        el("span", { className: "tp-rule-icon", text: "i" }),
+        el("p", { text: "一台 TsingPaws 同时只能绑定一个 APP 账号。更换账号前，请先在原 APP 中解除绑定。" }),
+      ]),
+    );
+    root.appendChild(refs.pairCard);
     STATE.refs = refs;
     return root;
   }
@@ -132,8 +182,34 @@
     refs.cloud.className = status.relay_connected ? "ok" : "warn";
     refs.assistant.textContent = status.pico_reachable ? "正常" : "暂不可用";
     refs.assistant.className = status.pico_reachable ? "ok" : "warn";
-    refs.bind.disabled = STATE.busy || refs.code.value.length !== 6 || !status.registered;
-    refs.bind.textContent = STATE.busy ? "正在添加…" : "确认添加";
+    const known = Boolean(status.binding_known);
+    const bound = Boolean(status.bound);
+    const hint = status.account_hint || "原 APP";
+    refs.stateCard.className = `tp-state-card ${!known ? "loading" : bound ? "bound" : "unbound"}`;
+    refs.stateIcon.textContent = !known ? "…" : bound ? "✓" : "＋";
+    refs.stateTitle.textContent = !known ? "正在确认绑定状态" : bound ? "已连接到 TsingPaws APP" : "等待绑定 TsingPaws APP";
+    refs.stateDesc.textContent = !known
+      ? "请稍候，正在读取这台 TsingPaws 的连接信息。"
+      : bound
+        ? "绑定已完成，可以在相同账号的手机和电脑上开始对话。"
+        : "输入 APP 生成的六位绑定码，即可完成连接。";
+    refs.account.textContent = bound ? `当前绑定账号  ${hint}` : "";
+    refs.account.hidden = !bound;
+    refs.health.hidden = !bound;
+    refs.code.disabled = !status.pairing_enabled || STATE.busy;
+    refs.code.placeholder = bound ? "已完成绑定" : known ? "六位绑定码" : "正在确认";
+    if (bound) refs.code.value = "";
+    refs.bind.disabled = STATE.busy || refs.code.value.length !== 6 || !status.pairing_enabled;
+    refs.bind.textContent = STATE.busy ? "正在绑定…" : bound ? "已绑定" : !known ? "确认状态中" : "确认绑定";
+    refs.pairCard.classList.toggle("is-bound", bound);
+    refs.pairTitle.textContent = bound ? "这台 TsingPaws 已完成绑定" : "添加到 TsingPaws APP";
+    refs.pairDesc.textContent = bound
+      ? "如需更换账号，请先使用原账号在 APP 中解除绑定。"
+      : "在 APP 中选择“添加 TsingPaws”，然后输入 APP 显示的六位绑定码。";
+    refs.boundNotice.textContent = bound
+      ? `请使用 ${hint} 账号在原 APP 中解除绑定后，再连接其他账号。`
+      : "";
+    refs.boundNotice.hidden = !bound;
     decorateNav();
   }
 

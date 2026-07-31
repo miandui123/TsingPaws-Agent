@@ -13,6 +13,7 @@ Security constraints (internal-test hardening):
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ from urllib.request import Request, urlopen
 # Fixed loopback targets. Env may change the port, never the host.
 _DEFAULT_UPSTREAM = "http://127.0.0.1:18880"
 _DEFAULT_AGENT = "http://127.0.0.1:18791"
+_DEFAULT_PICO_UPSTREAM = "http://127.0.0.1:18790"
 LISTEN_HOST = os.environ.get("BRIDGE_LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("BRIDGE_LISTEN_PORT", "18800"))
 STATIC_DIR = os.environ.get("BRIDGE_STATIC_DIR", "/opt/tsingpaws-agent/static")
@@ -70,9 +72,11 @@ PAIRING_MESSAGES = {
 }
 
 
-def pairing_message(code: str, retry_after: int = 0) -> str:
+def pairing_message(code: str, retry_after: int = 0, account_hint: str = "") -> str:
     if code == "rate_limited":
         return f"尝试次数过多，请在 {max(1, int(retry_after or 30))} 秒后重试"
+    if code == "device_already_bound" and account_hint:
+        return f"这台 TsingPaws 已绑定，请使用 {account_hint} 账号在原 APP 中解除绑定"
     return PAIRING_MESSAGES.get(code, "绑定失败，请稍后再试")
 
 
@@ -92,6 +96,10 @@ def assert_loopback_url(name: str, value: str) -> str:
 
 UPSTREAM = assert_loopback_url("LAUNCHER_UPSTREAM", os.environ.get("LAUNCHER_UPSTREAM", _DEFAULT_UPSTREAM))
 AGENT_STATUS = assert_loopback_url("AGENT_STATUS_BASE", os.environ.get("AGENT_STATUS_BASE", _DEFAULT_AGENT))
+PICO_UPSTREAM = assert_loopback_url(
+    "PICO_HTTP_UPSTREAM",
+    os.environ.get("PICO_HTTP_UPSTREAM", _DEFAULT_PICO_UPSTREAM),
+)
 
 HOP_BY_HOP = {
     "connection",
@@ -247,6 +255,69 @@ def upstream_cookie_for_request(cookie_header: str) -> str:
     return upstream_cookie
 
 
+def pico_websocket_token() -> str:
+    """Read the effective Pico token without exposing it to the browser or logs."""
+    token = (os.environ.get("PICO_TOKEN") or "").strip()
+    path = (
+        os.environ.get("PICO_SECURITY_FILE")
+        or "/opt/tsingpaw/data/.security.yml"
+    ).strip()
+    if path:
+        try:
+            lines = open(path, "r", encoding="utf-8").read().splitlines()
+        except OSError:
+            lines = []
+        channels_indent = None
+        pico_indent = None
+        for line in lines:
+            stripped = line.lstrip(" ")
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(line) - len(stripped)
+            key, separator, value = stripped.partition(":")
+            if not separator:
+                continue
+            key = key.strip()
+            if pico_indent is not None and indent <= pico_indent:
+                pico_indent = None
+            if channels_indent is not None and indent <= channels_indent:
+                channels_indent = None
+                pico_indent = None
+            if channels_indent is None and key == "channels" and not value.strip():
+                channels_indent = indent
+                continue
+            if (
+                channels_indent is not None
+                and pico_indent is None
+                and indent > channels_indent
+                and key == "pico"
+                and not value.strip()
+            ):
+                pico_indent = indent
+                continue
+            if pico_indent is not None and indent > pico_indent and key == "token":
+                candidate = value.strip()
+                if (
+                    len(candidate) >= 2
+                    and candidate[0] == candidate[-1]
+                    and candidate[0] in ("'", '"')
+                ):
+                    candidate = candidate[1:-1]
+                if candidate and not candidate.startswith("enc://"):
+                    token = candidate
+                break
+    return token
+
+
+def pico_websocket_subprotocol() -> str:
+    """Build the browser protocol value from Pico's effective token."""
+    token = pico_websocket_token()
+    if not token:
+        return ""
+    encoded = base64.urlsafe_b64encode(token.encode("utf-8")).decode("ascii").rstrip("=")
+    return "token.b64." + encoded
+
+
 def ui_state(agent_running: bool, payload: Dict) -> Dict:
     if not agent_running:
         return {
@@ -325,6 +396,9 @@ def build_status() -> Dict:
             "auto_reconnect": True,
             "autostart": True,
             "active_sessions": 0,
+            "binding_known": False,
+            "bound": False,
+            "account_hint": "",
         }
     for key in list(payload.keys()):
         lk = key.lower()
@@ -339,7 +413,14 @@ def build_status() -> Dict:
         pairing_label = "最近绑定失败"
     else:
         pairing_label = "未进行绑定"
-    pairing_enabled = mode == "internal_test" and bool(payload.get("registered"))
+    binding_known = bool(payload.get("binding_known"))
+    bound = bool(payload.get("bound"))
+    pairing_enabled = (
+        mode == "internal_test"
+        and bool(payload.get("registered"))
+        and binding_known
+        and not bound
+    )
     return {
         "agent_running": running,
         "service": "tsingpaws-agent",
@@ -353,6 +434,11 @@ def build_status() -> Dict:
         "pairing_disabled_reason": None
         if pairing_enabled
         else (
+            pairing_message("device_already_bound", account_hint=str(payload.get("account_hint") or ""))
+            if bound
+            else "正在确认 TsingPaws 的绑定状态"
+            if mode == "internal_test" and payload.get("registered") and not binding_known
+            else
             "当前仍为单机版，绑定码输入将在切换内部测试版后可用"
             if mode != "internal_test"
             else "设备尚未完成内部测试版注册"
@@ -579,6 +665,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         # Refuse claim attempts while the agent is still on the single-node protocol.
         st = build_status()
+        if st.get("bound"):
+            self._send_json(
+                409,
+                {
+                    "ok": False,
+                    "error": "device_already_bound",
+                    "message": pairing_message(
+                        "device_already_bound",
+                        account_hint=str(st.get("account_hint") or ""),
+                    ),
+                },
+            )
+            return
         if not st.get("pairing_enabled"):
             self._send_json(
                 503,
@@ -637,7 +736,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             error = str(body.get("error") or "relay_error")
             retry_after = body.get("retry_after") or 0
-            out = {"ok": False, "error": error, "message": pairing_message(error, retry_after)}
+            account_hint = str(body.get("account_hint") or "")
+            out = {
+                "ok": False,
+                "error": error,
+                "message": pairing_message(error, retry_after, account_hint),
+            }
             if retry_after:
                 out["retry_after"] = retry_after
             log.info("pairing claim rejected result=%s", error)
@@ -685,25 +789,38 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 pass
 
     def _proxy_websocket(self, upstream) -> None:
+        # The Launcher validates the browser protocol but its second proxy hop
+        # has intermittently dropped Gateway authorization after Agent
+        # deployments. Once the Launcher session cookie has been validated,
+        # connect to the loopback-only Gateway directly with the same effective
+        # token used by the Agent.
+        upstream = urlsplit(PICO_UPSTREAM)
         port = upstream.port or (443 if upstream.scheme == "https" else 80)
         req = [f"{self.command} {self.path} HTTP/1.1\r\n"]
         upstream_cookie = upstream_cookie_for_request(self.headers.get("Cookie", ""))
+        local_token = pico_websocket_token() if upstream_cookie else ""
+        local_subprotocol = pico_websocket_subprotocol() if local_token else ""
         log.info(
-            "websocket proxy attempt path=%s incoming_cookie=%s upstream_cookie=%s",
+            "websocket proxy attempt path=%s incoming_cookie=%s upstream_cookie=%s subprotocol=%s synchronized=%s",
             self.path,
             bool(self.headers.get("Cookie")),
             bool(upstream_cookie),
+            bool(self.headers.get("Sec-WebSocket-Protocol")),
+            bool(local_subprotocol),
         )
         for k, v in self.headers.items():
             lk = k.lower()
-            if lk in HOP_BY_HOP or lk in ("host", "cookie"):
+            if lk in HOP_BY_HOP or lk in ("host", "cookie", "authorization", "origin"):
+                continue
+            if lk == "sec-websocket-protocol" and local_subprotocol:
+                req.append(f"{k}: {local_subprotocol}\r\n")
                 continue
             req.append(f"{k}: {v}\r\n")
         req.append(f"Host: {upstream.hostname}:{port}\r\n")
         req.append("Connection: Upgrade\r\n")
         req.append("Upgrade: websocket\r\n")
-        if upstream_cookie:
-            req.append(f"Cookie: {upstream_cookie}\r\n")
+        if local_token:
+            req.append(f"Authorization: Bearer {local_token}\r\n")
         req.append("\r\n")
         upstream_sock: Optional[socket.socket] = None
         try:

@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import stat
 import sys
 import time
@@ -37,7 +38,7 @@ from websockets.legacy.client import connect as ws_connect
 
 import file_transfer as xfer
 
-AGENT_VERSION = "2.1.1-filexfer"
+AGENT_VERSION = "2.3.0-binding-ui"
 MAX_MESSAGE_SIZE = 4 * 1024 * 1024
 MIN_BACKOFF = 2.0
 MAX_BACKOFF = 30.0
@@ -51,7 +52,9 @@ MODE_INTERNAL = "internal_test"
 VALID_MODES = (MODE_SINGLE, MODE_INTERNAL)
 
 REQUIRED_RELAY_VERSION = "internal-test-2"
-REQUIRED_RELAY_VERSIONS = frozenset({"internal-test-auth-1", "internal-test-2"})
+REQUIRED_RELAY_VERSIONS = frozenset(
+    {"internal-test-auth-1", "internal-test-2", "internal-test-sync-1"}
+)
 REQUIRED_PAIRING_FLOW = "app_first_invitation"
 
 FILE_MSG_TYPES = frozenset({"file.start", "file.chunk", "file.end"})
@@ -123,8 +126,74 @@ def pico_base_url() -> str:
     return env("PICO_BASE_URL", "ws://127.0.0.1:18790").rstrip("/")
 
 
+def _yaml_scalar(value: str) -> str:
+    raw = value.strip()
+    if not raw or raw in ("|", ">"):
+        return ""
+    if len(raw) >= 2 and raw[0] == raw[-1] == "'":
+        return raw[1:-1].replace("''", "'")
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        try:
+            decoded = json.loads(raw)
+            return decoded if isinstance(decoded, str) else ""
+        except ValueError:
+            return ""
+    return raw.split(" #", 1)[0].strip()
+
+
+def _pico_security_token() -> str:
+    """Read channels.pico.token from PicoClaw's root-only security YAML.
+
+    OpenWrt's trimmed Python build doesn't ship PyYAML. The security file uses a
+    simple nested mapping for this field, so parse only that exact path and
+    leave every other YAML construct untouched.
+    """
+    path = env("PICO_SECURITY_FILE")
+    if not path:
+        return ""
+    try:
+        lines = open(path, "r", encoding="utf-8").read().splitlines()
+    except OSError:
+        return ""
+
+    channels_indent: Optional[int] = None
+    pico_indent: Optional[int] = None
+    for line in lines:
+        stripped = line.lstrip(" ")
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(stripped)
+        key, separator, value = stripped.partition(":")
+        if not separator:
+            continue
+        key = key.strip()
+
+        if pico_indent is not None and indent <= pico_indent:
+            pico_indent = None
+        if channels_indent is not None and indent <= channels_indent:
+            channels_indent = None
+            pico_indent = None
+
+        if channels_indent is None and key == "channels" and not value.strip():
+            channels_indent = indent
+            continue
+        if (
+            channels_indent is not None
+            and pico_indent is None
+            and indent > channels_indent
+            and key == "pico"
+            and not value.strip()
+        ):
+            pico_indent = indent
+            continue
+        if pico_indent is not None and indent > pico_indent and key == "token":
+            token = _yaml_scalar(value)
+            return "" if token.startswith("enc://") else token
+    return ""
+
+
 def pico_token() -> str:
-    return env("PICO_TOKEN")
+    return _pico_security_token() or env("PICO_TOKEN")
 
 
 def pico_ws_path() -> str:
@@ -588,6 +657,126 @@ def save_last_session_id(session_id: str) -> None:
             pass
 
 
+def _read_key_values(path: str, separator: str = ":") -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if separator not in line:
+                    continue
+                key, value = line.split(separator, 1)
+                values[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return values
+
+
+def _machine_lan_ip() -> str:
+    preferred = env("LAN_IP_OVERRIDE")
+    if preferred:
+        try:
+            socket.inet_aton(preferred)
+            if preferred != "0.0.0.0" and not preferred.startswith("127."):
+                return preferred
+        except OSError:
+            pass
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        value = str(sock.getsockname()[0])
+        return "" if value.startswith("127.") else value
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+
+
+def _cpu_sample() -> Tuple[int, int]:
+    try:
+        with open("/proc/stat", "r", encoding="ascii") as fh:
+            parts = fh.readline().split()[1:]
+        values = [int(value) for value in parts]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        return idle, sum(values)
+    except (OSError, ValueError, IndexError):
+        return 0, 0
+
+
+def _cpu_percent() -> Optional[float]:
+    idle_before, total_before = _cpu_sample()
+    if total_before <= 0:
+        return None
+    time.sleep(0.15)
+    idle_after, total_after = _cpu_sample()
+    total_delta = total_after - total_before
+    if total_delta <= 0:
+        return None
+    value = 100.0 * (1.0 - (idle_after - idle_before) / total_delta)
+    return round(max(0.0, min(100.0, value)), 1)
+
+
+def _temperature_celsius() -> Optional[float]:
+    values = []
+    for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            value = float(open(path, "r", encoding="ascii").read().strip())
+            if value > 1000:
+                value /= 1000.0
+            if -20 <= value <= 150:
+                values.append(value)
+        except (OSError, ValueError):
+            continue
+    return round(max(values), 1) if values else None
+
+
+def _scheduled_tasks() -> list:
+    path = os.path.join(pico_workspace(), "cron", "jobs.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            document = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, list):
+        return []
+    result = []
+    for item in jobs[:100]:
+        if not isinstance(item, dict):
+            continue
+        schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else {}
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        state = item.get("state") if isinstance(item.get("state"), dict) else {}
+        result.append(
+            {
+                "id": str(item.get("id") or "")[:120],
+                "name": str(item.get("name") or payload.get("message") or "未命名任务")[:300],
+                "enabled": bool(item.get("enabled")),
+                "schedule_kind": str(schedule.get("kind") or "")[:32],
+                "cron_expression": str(
+                    schedule.get("expr")
+                    or schedule.get("expression")
+                    or schedule.get("cron")
+                    or ""
+                )[:120],
+                "every_ms": int(schedule.get("everyMs") or 0)
+                if isinstance(schedule.get("everyMs"), (int, float))
+                else 0,
+                "at_ms": int(schedule.get("atMs") or 0)
+                if isinstance(schedule.get("atMs"), (int, float))
+                else 0,
+                "last_run_at_ms": int(state.get("lastRunAtMs") or 0)
+                if isinstance(state.get("lastRunAtMs"), (int, float))
+                else 0,
+                "next_run_at_ms": int(state.get("nextRunAtMs") or 0)
+                if isinstance(state.get("nextRunAtMs"), (int, float))
+                else 0,
+                "last_status": str(state.get("lastStatus") or "")[:60],
+                "description": str(payload.get("message") or "")[:1000],
+            }
+        )
+    return result
+
+
 @dataclass
 class SessionState:
     """Per-session busy / cancel / typing state (never a global lock)."""
@@ -685,6 +874,7 @@ class Agent:
         self._stop = asyncio.Event()
         self._reconnect_event = asyncio.Event()
         self._claim_lock = asyncio.Lock()
+        self._binding_status_lock = asyncio.Lock()
         self._outbox_replay_lock = asyncio.Lock()
         self.started_at = time.time()
         self.mode = read_mode()
@@ -699,6 +889,10 @@ class Agent:
         self.credential_invalid = False
         self.last_pairing_result: Optional[str] = None
         self.last_pairing_at: Optional[str] = None
+        self.binding_known = False
+        self.binding_bound = False
+        self.binding_account_hint = ""
+        self.binding_checked_at = 0.0
         self.last_session_id: str = load_last_session_id()
         self.ack_capable_sessions: Set[str] = set()
         self.transfers = xfer.TransferManager(
@@ -1165,6 +1359,18 @@ class Agent:
                 return
 
             session_id = extract_session_id(message)
+            if kind == "device.status.request":
+                if not session_id:
+                    log.warning("status request missing session_id")
+                    return
+                request_payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                request_id = str(request_payload.get("request_id") or obj.get("id") or "")[:120]
+                status = await asyncio.to_thread(self.device_status_payload)
+                status["request_id"] = request_id
+                await self.send_to_app(
+                    make_envelope("device.status.response", session_id, status)
+                )
+                return
             if kind == MESSAGE_ACK_TYPE:
                 payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
                 message_id = payload.get("message_id")
@@ -1795,6 +2001,7 @@ class Agent:
         if status == 200:
             self.last_pairing_result = "claimed"
             self.last_pairing_at = now_iso()
+            await self.refresh_binding_status(force=True)
             log.info("pairing claim succeeded")
             return 200, {"ok": True, "status": "claimed"}
 
@@ -1815,6 +2022,14 @@ class Agent:
         log.info("pairing claim failed result=%s", self.last_pairing_result)
 
         out: Dict[str, Any] = {"ok": False, "error": self.last_pairing_result}
+        if status == 409 and isinstance(body, dict):
+            hint = str(body.get("account_hint") or "").strip()[:80]
+            self.binding_known = True
+            self.binding_bound = True
+            self.binding_account_hint = hint
+            self.binding_checked_at = time.time()
+            if hint:
+                out["account_hint"] = hint
         if status == 429:
             retry_after = 30
             for key, value in (headers or {}).items():
@@ -1833,6 +2048,37 @@ class Agent:
         return 502, out
 
     # ---- status API payloads ----
+
+    async def refresh_binding_status(self, force: bool = False) -> None:
+        if self.mode != MODE_INTERNAL or not self.registered:
+            self.binding_known = True
+            self.binding_bound = False
+            self.binding_account_hint = ""
+            self.binding_checked_at = time.time()
+            return
+        if not force and time.time() - self.binding_checked_at < 10:
+            return
+        async with self._binding_status_lock:
+            if not force and time.time() - self.binding_checked_at < 10:
+                return
+            token = self.device_token()
+            if not token:
+                return
+            status, body, _ = await asyncio.to_thread(
+                http_json,
+                "GET",
+                relay_http_base() + "/v1/devices/self/binding",
+                None,
+                token,
+                5.0,
+            )
+            if status == 200 and isinstance(body, dict):
+                self.binding_known = True
+                self.binding_bound = bool(body.get("bound"))
+                self.binding_account_hint = str(body.get("account_hint") or "").strip()[:80]
+                self.binding_checked_at = time.time()
+            elif status == 401:
+                self.credential_invalid = True
 
     def status_payload(self) -> Dict[str, Any]:
         device_id = self.device_id()
@@ -1854,11 +2100,58 @@ class Agent:
             "credential_invalid": bool(self.credential_invalid),
             "last_pairing_result": self.last_pairing_result,
             "last_pairing_at": self.last_pairing_at,
+            "binding_known": bool(self.binding_known),
+            "bound": bool(self.binding_bound),
+            "account_hint": self.binding_account_hint,
             "auto_reconnect": True,
             "autostart": True,
             "active_sessions": len(self.sessions),
             "active_transfers": self.transfers.active_count(),
             "agent_version": AGENT_VERSION,
+        }
+
+    def device_status_payload(self) -> Dict[str, Any]:
+        memory = _read_key_values("/proc/meminfo")
+        try:
+            memory_total = int(memory.get("MemTotal", "0 kB").split()[0]) * 1024
+            memory_available = int(memory.get("MemAvailable", "0 kB").split()[0]) * 1024
+        except (ValueError, IndexError):
+            memory_total = 0
+            memory_available = 0
+        try:
+            disk = shutil.disk_usage(pico_workspace())
+        except OSError:
+            disk = shutil.disk_usage("/")
+        try:
+            with open("/proc/uptime", "r", encoding="ascii") as fh:
+                machine_uptime = int(float(fh.read().split()[0]))
+        except (OSError, ValueError, IndexError):
+            machine_uptime = 0
+        try:
+            load_average = [round(value, 2) for value in os.getloadavg()]
+        except (AttributeError, OSError):
+            load_average = []
+        try:
+            hostname = socket.gethostname()
+            os_name = " ".join(os.uname())
+        except (AttributeError, OSError):
+            hostname = ""
+            os_name = ""
+        return {
+            **self.status_payload(),
+            "collected_at": now_iso(),
+            "hostname": hostname[:120],
+            "lan_ip": _machine_lan_ip(),
+            "os_name": os_name[:300],
+            "cpu_percent": _cpu_percent(),
+            "load_average": load_average,
+            "memory_total": memory_total,
+            "memory_used": max(0, memory_total - memory_available),
+            "disk_total": int(disk.total),
+            "disk_used": int(disk.used),
+            "temperature_celsius": _temperature_celsius(),
+            "machine_uptime_seconds": machine_uptime,
+            "scheduled_tasks": _scheduled_tasks(),
         }
 
     def health_payload(self) -> Dict[str, Any]:
@@ -2055,6 +2348,7 @@ class StatusServer:
             if method == "GET" and path == "/health":
                 await self._json(writer, 200, self.agent.health_payload())
             elif method == "GET" and path == "/status":
+                await self.agent.refresh_binding_status()
                 await self._json(writer, 200, self.agent.status_payload())
             elif method == "POST" and path == "/reconnect":
                 self.agent.request_reconnect()
