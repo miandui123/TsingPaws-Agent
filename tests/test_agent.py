@@ -17,6 +17,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -417,3 +418,110 @@ def test_18_pico_security_file_token_overrides_stale_env(monkeypatch, tmp_path):
     monkeypatch.setenv("PICO_TOKEN", "stale-pico-token")
 
     assert ag.pico_token() == "current-pico-token"
+
+
+def _write_tool_call_session(workspace: Path, session_id: str, name: str, arguments: Dict[str, Any]):
+    sessions = workspace / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    path = sessions / f"agent_main_pico_direct_pico_{session_id}.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                        }
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_19_generate_document_recovers_docx_from_inbox(conf, monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    inbox = workspace / "inbox"
+    inbox.mkdir(parents=True)
+    monkeypatch.setenv("PICO_WORKSPACE", str(workspace))
+    session_id = "document-recovery-session"
+    _write_tool_call_session(
+        workspace,
+        session_id,
+        "generate_document",
+        {"filename": "深圳攻略.docx"},
+    )
+    generated = inbox / "深圳攻略-2.docx"
+    generated.write_bytes(b"PK-test-docx")
+    agent = ag.Agent()
+    pushed = []
+
+    async def capture(sid, path, name, mime):
+        pushed.append((sid, path, name, mime))
+
+    monkeypatch.setattr(agent, "_push_local_file_to_app", capture)
+    state = ag.SessionState(task_started_at=generated.stat().st_mtime - 1)
+    assert asyncio.run(agent._push_generated_document_fallback(session_id, state))
+    assert pushed == [
+        (
+            session_id,
+            str(generated.resolve()),
+            "深圳攻略-2.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    ]
+    assert not asyncio.run(agent._push_generated_document_fallback(session_id, state))
+
+
+def test_20_send_file_relative_path_resolves_inbox(conf, monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    inbox = workspace / "inbox"
+    inbox.mkdir(parents=True)
+    monkeypatch.setenv("PICO_WORKSPACE", str(workspace))
+    session_id = "send-file-inbox-session"
+    _write_tool_call_session(
+        workspace,
+        session_id,
+        "send_file",
+        {"path": "会议纪要.docx"},
+    )
+    generated = inbox / "会议纪要.docx"
+    generated.write_bytes(b"PK-test-docx")
+    agent = ag.Agent()
+    pushed = []
+
+    async def capture(sid, path, name, mime):
+        pushed.append((sid, path, name, mime))
+
+    monkeypatch.setattr(agent, "_push_local_file_to_app", capture)
+    state = ag.SessionState(task_started_at=generated.stat().st_mtime - 1)
+    assert asyncio.run(agent._push_send_file_fallback(session_id, state))
+    assert pushed[0][1] == str(generated.resolve())
+
+
+def test_21_send_file_still_rejects_unapproved_path(conf, monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("PICO_WORKSPACE", str(workspace))
+    session_id = "send-file-reject-session"
+    _write_tool_call_session(
+        workspace,
+        session_id,
+        "send_file",
+        {"path": "/etc/passwd"},
+    )
+    agent = ag.Agent()
+    pushed = []
+
+    async def capture(*args):
+        pushed.append(args)
+
+    monkeypatch.setattr(agent, "_push_local_file_to_app", capture)
+    state = ag.SessionState(task_started_at=time.time() - 1)
+    assert not asyncio.run(agent._push_send_file_fallback(session_id, state))
+    assert pushed == []

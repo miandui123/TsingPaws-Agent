@@ -1043,6 +1043,9 @@ class Agent:
                 if await self._push_send_file_fallback(session_id, state):
                     await self.finish_session_task(session_id, success=True)
                     return
+                if await self._push_generated_document_fallback(session_id, state):
+                    await self.finish_session_task(session_id, success=True)
+                    return
                 if await self._push_generated_image_fallback(session_id, "", state, force=True):
                     await self.finish_session_task(session_id, success=True)
                     return
@@ -1925,13 +1928,28 @@ class Agent:
                     raw_path = args_obj.get("path")
                     if not isinstance(raw_path, str) or not raw_path.strip():
                         continue
-                    path = os.path.realpath(raw_path.strip())
-                    try:
-                        in_tmp = os.path.commonpath((path, "/tmp")) == "/tmp"
-                    except ValueError:
-                        in_tmp = False
-                    if not in_tmp and not xfer.is_approved_outbound_path(path, pico_workspace()):
-                        log.warning("reject unapproved send_file path session=%s", session_id)
+                    raw_path = raw_path.strip()
+                    workspace = pico_workspace()
+                    if os.path.isabs(raw_path):
+                        candidates = (raw_path,)
+                    else:
+                        candidates = (
+                            os.path.join(workspace, raw_path),
+                            os.path.join(workspace, "inbox", raw_path),
+                        )
+                    path = ""
+                    for candidate in candidates:
+                        resolved = os.path.realpath(candidate)
+                        try:
+                            in_tmp = os.path.commonpath((resolved, "/tmp")) == "/tmp"
+                        except ValueError:
+                            in_tmp = False
+                        if not in_tmp and not xfer.is_approved_outbound_path(resolved, workspace):
+                            continue
+                        if os.path.isfile(resolved):
+                            path = resolved
+                            break
+                    if not path:
                         continue
                     try:
                         st = os.stat(path)
@@ -1954,6 +1972,107 @@ class Agent:
                         raise
                     recovered = True
                     log.info("recovered send_file session=%s name=%s", session_id, name)
+        return recovered
+
+    async def _push_generated_document_fallback(
+        self, session_id: str, state: SessionState
+    ) -> bool:
+        """Recover documents created by Pico's generate_document tool.
+
+        Pico writes these files to workspace/inbox but currently returns a
+        misleading delivery marker without emitting an attachment event. Only
+        filenames explicitly requested by generate_document in this session
+        and files created during the current task are eligible.
+        """
+        started = state.task_started_at
+        workspace = pico_workspace()
+        inbox = os.path.join(workspace, "inbox")
+        if started <= 0 or not os.path.isdir(inbox):
+            return False
+
+        sessions_dir = os.path.join(workspace, "sessions")
+        patterns = (
+            os.path.join(sessions_dir, f"*{session_id}.jsonl"),
+            os.path.join("/root/.picoclaw/workspace/sessions", f"*{session_id}.jsonl"),
+        )
+        requested_names: Set[str] = set()
+        seen_logs: Set[str] = set()
+        for pattern in patterns:
+            for log_path in glob.glob(pattern):
+                real_log = os.path.realpath(log_path)
+                if real_log in seen_logs:
+                    continue
+                seen_logs.add(real_log)
+                try:
+                    if os.path.getmtime(real_log) + 2 < started:
+                        continue
+                    with open(real_log, "r", encoding="utf-8") as fh:
+                        lines = fh.readlines()[-160:]
+                except (OSError, UnicodeError):
+                    continue
+                for line in lines:
+                    try:
+                        entry = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                        continue
+                    calls = entry.get("tool_calls")
+                    if not isinstance(calls, list):
+                        continue
+                    for call in calls:
+                        fn = call.get("function") if isinstance(call, dict) else None
+                        if not isinstance(fn, dict) or fn.get("name") != "generate_document":
+                            continue
+                        args = fn.get("arguments")
+                        try:
+                            args_obj = json.loads(args) if isinstance(args, str) else args
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(args_obj, dict):
+                            continue
+                        filename = args_obj.get("filename")
+                        if isinstance(filename, str) and filename.strip():
+                            requested_names.add(
+                                xfer.sanitize_filename(os.path.basename(filename.strip()))
+                            )
+
+        recovered = False
+        for requested_name in requested_names:
+            stem, suffix = os.path.splitext(requested_name)
+            try:
+                entries = os.listdir(inbox)
+            except OSError:
+                continue
+            for entry_name in entries:
+                entry_stem, entry_suffix = os.path.splitext(entry_name)
+                if entry_suffix.lower() != suffix.lower():
+                    continue
+                if entry_stem != stem and not re.fullmatch(
+                    re.escape(stem) + r"-\d+", entry_stem
+                ):
+                    continue
+                path = os.path.realpath(os.path.join(inbox, entry_name))
+                if not xfer.is_approved_outbound_path(path, workspace):
+                    continue
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode) or st.st_mtime + 2 < started:
+                    continue
+                if path in state.pushed_paths:
+                    continue
+                name = xfer.sanitize_filename(entry_name)
+                mime = xfer.guess_mime(name)
+                state.pushed_paths.add(path)
+                try:
+                    await self._push_local_file_to_app(session_id, path, name, mime)
+                except Exception:
+                    state.pushed_paths.discard(path)
+                    raise
+                recovered = True
+                log.info("recovered generated document session=%s name=%s", session_id, name)
         return recovered
 
     async def _push_generated_image_fallback(
