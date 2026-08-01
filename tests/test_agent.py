@@ -478,6 +478,84 @@ def test_19_generate_document_recovers_docx_from_inbox(conf, monkeypatch, tmp_pa
     assert not asyncio.run(agent._push_generated_document_fallback(session_id, state))
 
 
+def test_20_outbound_file_spool_is_durable_and_ack_removes_it(conf, tmp_path):
+    os.environ.pop("AGENT_DATA_DIR", None)
+    source = tmp_path / "报告.docx"
+    source.write_bytes(b"PK-reliable-document")
+    os.chmod(source, 0o640)
+    original_mode = stat.S_IMODE(source.stat().st_mode)
+    agent = ag.Agent()
+    transfer_id = "12345678-1234-1234-1234-123456789abc"
+
+    agent._queue_outbound_file(
+        transfer_id,
+        "session-file-reliability",
+        str(source),
+        source.name,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    outbox = conf / "outbox"
+    data_path = outbox / f"{transfer_id}.bin"
+    meta_path = outbox / f"{transfer_id}.json"
+    assert data_path.read_bytes() == source.read_bytes()
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["session_id"] == "session-file-reliability"
+    assert stat.S_IMODE(source.stat().st_mode) == original_mode
+
+    agent._ack_outbound_file(transfer_id)
+    assert not data_path.exists()
+    assert not meta_path.exists()
+    assert source.exists()
+
+
+def test_20a_outbound_file_spool_uses_data_disk_and_migrates(conf, monkeypatch, tmp_path):
+    legacy = conf / "outbox"
+    legacy.mkdir()
+    transfer_id = "87654321-4321-4321-4321-cba987654321"
+    (legacy / f"{transfer_id}.bin").write_bytes(b"queued-before-upgrade")
+    (legacy / f"{transfer_id}.json").write_text(
+        json.dumps({"transfer_id": transfer_id, "session_id": "session-before-upgrade"}),
+        encoding="utf-8",
+    )
+    data_dir = tmp_path / "large-data-disk"
+    monkeypatch.setenv("AGENT_DATA_DIR", str(data_dir))
+
+    agent = ag.Agent()
+
+    assert agent._outbox_dir() == str(data_dir / "outbox")
+    assert (data_dir / "outbox" / f"{transfer_id}.bin").read_bytes() == b"queued-before-upgrade"
+    assert not (legacy / f"{transfer_id}.bin").exists()
+
+
+def test_19b_generate_document_matches_pico_sanitized_chinese_punctuation(
+    conf, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    inbox = workspace / "inbox"
+    inbox.mkdir(parents=True)
+    monkeypatch.setenv("PICO_WORKSPACE", str(workspace))
+    session_id = "document-punctuation-session"
+    requested = "后海的傍晚，是吃饱了最该去的地方.docx"
+    _write_tool_call_session(
+        workspace,
+        session_id,
+        "generate_document",
+        {"filename": requested},
+    )
+    generated = inbox / "后海的傍晚_是吃饱了最该去的地方-2.docx"
+    generated.write_bytes(b"PK-test-docx")
+    agent = ag.Agent()
+    pushed = []
+
+    async def capture(sid, path, name, mime):
+        pushed.append((sid, path, name, mime))
+
+    monkeypatch.setattr(agent, "_push_local_file_to_app", capture)
+    state = ag.SessionState(task_started_at=generated.stat().st_mtime - 1)
+    assert asyncio.run(agent._push_generated_document_fallback(session_id, state))
+    assert pushed[0][2] == generated.name
+
+
 def test_20_send_file_relative_path_resolves_inbox(conf, monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     inbox = workspace / "inbox"
@@ -504,6 +582,65 @@ def test_20_send_file_relative_path_resolves_inbox(conf, monkeypatch, tmp_path):
     assert pushed[0][1] == str(generated.resolve())
 
 
+def test_20b_send_file_resends_older_pico_sanitized_document(
+    conf, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    inbox = workspace / "inbox"
+    inbox.mkdir(parents=True)
+    monkeypatch.setenv("PICO_WORKSPACE", str(workspace))
+    session_id = "send-file-old-punctuation-session"
+    generated = inbox / "后海的傍晚_是吃饱了最该去的地方-2.docx"
+    generated.write_bytes(b"PK-test-docx")
+    old_time = time.time() - 3600
+    os.utime(generated, (old_time, old_time))
+    sessions = workspace / "sessions"
+    sessions.mkdir()
+    entries = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "send_file",
+                        "arguments": json.dumps({"path": "unrelated-old.docx"}),
+                    }
+                }
+            ],
+        },
+        {"role": "user", "content": "请把刚才的文件重新发给我"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "send_file",
+                        "arguments": json.dumps(
+                            {"path": "后海的傍晚，是吃饱了最该去的地方.docx"},
+                            ensure_ascii=False,
+                        ),
+                    }
+                }
+            ],
+        },
+    ]
+    (sessions / f"agent_{session_id}.jsonl").write_text(
+        "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n",
+        encoding="utf-8",
+    )
+    agent = ag.Agent()
+    pushed = []
+
+    async def capture(sid, path, name, mime):
+        pushed.append((sid, path, name, mime))
+
+    monkeypatch.setattr(agent, "_push_local_file_to_app", capture)
+    state = ag.SessionState(task_started_at=time.time() - 2)
+    assert asyncio.run(agent._push_send_file_fallback(session_id, state))
+    assert len(pushed) == 1
+    assert pushed[0][1] == str(generated.resolve())
+
+
 def test_21_send_file_still_rejects_unapproved_path(conf, monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -525,3 +662,54 @@ def test_21_send_file_still_rejects_unapproved_path(conf, monkeypatch, tmp_path)
     state = ag.SessionState(task_started_at=time.time() - 1)
     assert not asyncio.run(agent._push_send_file_fallback(session_id, state))
     assert pushed == []
+
+
+def test_22_recent_session_is_kept_connected_for_scheduled_output(
+    conf, monkeypatch
+):
+    agent = ag.Agent()
+    agent.last_session_id = "scheduled-output-session"
+    calls = []
+
+    class Session:
+        async def ensure(self):
+            calls.append("ensure")
+
+    async def get_session(session_id):
+        calls.append(session_id)
+        return Session()
+
+    monkeypatch.setattr(agent, "get_session", get_session)
+    assert asyncio.run(agent.ensure_recent_pico_session())
+    assert calls == ["scheduled-output-session", "ensure"]
+    assert agent.pico_reachable is True
+
+
+def test_23_outbox_retention_is_thirty_days(conf, tmp_path):
+    source = tmp_path / "scheduled-report.docx"
+    source.write_bytes(b"PK-scheduled-report")
+    agent = ag.Agent()
+    transfer_id = "22345678-1234-1234-1234-123456789abc"
+    agent._queue_outbound_file(
+        transfer_id,
+        "scheduled-output-session",
+        str(source),
+        source.name,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    outbox = conf / "outbox"
+    paths = [
+        outbox / f"{transfer_id}.bin",
+        outbox / f"{transfer_id}.json",
+    ]
+    retained_time = time.time() - 8 * 24 * 60 * 60
+    for path in paths:
+        os.utime(path, (retained_time, retained_time))
+    agent._cleanup_outbox()
+    assert all(path.exists() for path in paths)
+
+    expired_time = time.time() - 31 * 24 * 60 * 60
+    for path in paths:
+        os.utime(path, (expired_time, expired_time))
+    agent._cleanup_outbox()
+    assert not any(path.exists() for path in paths)

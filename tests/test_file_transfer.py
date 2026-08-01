@@ -271,4 +271,4 @@ def test_relay_health_accepts_sync_variant(monkeypatch):
 
 
 def test_agent_version_bumped():
-    assert ag.AGENT_VERSION == "2.3.0-binding-ui"
+    assert ag.AGENT_VERSION == "2.4.0-scheduled-delivery"

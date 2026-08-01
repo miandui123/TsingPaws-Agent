@@ -38,11 +38,12 @@ from websockets.legacy.client import connect as ws_connect
 
 import file_transfer as xfer
 
-AGENT_VERSION = "2.3.0-binding-ui"
+AGENT_VERSION = "2.4.0-scheduled-delivery"
 MAX_MESSAGE_SIZE = 4 * 1024 * 1024
 MIN_BACKOFF = 2.0
 MAX_BACKOFF = 30.0
 AUTH_BACKOFF = 300.0
+OUTBOX_TTL_SECONDS = 30 * 24 * 60 * 60
 STATUS_HOST = "127.0.0.1"
 TZ_CN = timezone(timedelta(hours=8))
 SESSION_TASK_TIMEOUT = 20 * 60  # image gen can exceed 8m; typing.start refreshes idle timer
@@ -893,6 +894,8 @@ class Agent:
         self.binding_bound = False
         self.binding_account_hint = ""
         self.binding_checked_at = 0.0
+        self._migrate_legacy_outbox()
+        self._cleanup_outbox()
         self.last_session_id: str = load_last_session_id()
         self.ack_capable_sessions: Set[str] = set()
         self.ignored_inbound_transfers: Set[str] = set()
@@ -1105,6 +1108,31 @@ class Agent:
             self.sessions[session_id] = sess
         return sess
 
+    async def ensure_recent_pico_session(self) -> bool:
+        """Keep the most recently active chat subscribed for scheduled output.
+
+        This local Pico connection is intentionally independent from the public
+        Relay connection. Scheduled jobs can therefore finish while the phone
+        sleeps or the public network is temporarily unavailable; their output
+        is queued locally and replayed later.
+        """
+        session_id = self.last_session_id
+        if not session_id:
+            return False
+        try:
+            session = await self.get_session(session_id)
+            await session.ensure()
+            self.pico_reachable = True
+            return True
+        except Exception as exc:
+            self.pico_reachable = False
+            log.warning(
+                "recent pico session keepalive failed session=%s err=%s",
+                session_id[:8],
+                redact(str(exc)),
+            )
+            return False
+
     async def push_file_to_recent_session(self, path: Any) -> Tuple[int, Dict[str, Any]]:
         """Push one approved local file to the most recently active APP chat."""
         if not isinstance(path, str) or not path.strip():
@@ -1140,13 +1168,80 @@ class Agent:
         return 200, {"ok": True, "session_id": session_id, "message_id": envelope["id"]}
 
     def _outbox_dir(self) -> str:
-        return os.path.join(conf_dir(), "outbox")
+        data_dir = os.getenv("AGENT_DATA_DIR", "").strip() or conf_dir()
+        return os.path.join(data_dir, "outbox")
 
     def _message_outbox_dir(self) -> str:
         return os.path.join(conf_dir(), "message-outbox")
 
     def _inbound_receipt_dir(self) -> str:
         return os.path.join(conf_dir(), "inbound-receipts")
+
+    def _migrate_legacy_outbox(self) -> None:
+        """Move queued attachments off the small overlay when a data disk is configured."""
+        legacy = os.path.join(conf_dir(), "outbox")
+        target = self._outbox_dir()
+        if os.path.realpath(legacy) == os.path.realpath(target) or not os.path.isdir(legacy):
+            return
+        try:
+            os.makedirs(target, mode=0o700, exist_ok=True)
+            names = os.listdir(legacy)
+        except OSError:
+            return
+        for name in names:
+            if not re.fullmatch(r"[A-Za-z0-9-]{8,80}\.(?:json|bin)", name):
+                continue
+            source = os.path.join(legacy, name)
+            destination = os.path.join(target, name)
+            if os.path.exists(destination):
+                continue
+            try:
+                os.replace(source, destination)
+            except OSError:
+                try:
+                    shutil.copy2(source, destination)
+                    os.unlink(source)
+                except OSError:
+                    try:
+                        os.unlink(destination)
+                    except OSError:
+                        pass
+
+    def _cleanup_outbox(self) -> None:
+        """Remove corrupt/orphaned or expired spool entries without touching live files."""
+        directory = self._outbox_dir()
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            entries = os.listdir(directory)
+        except OSError:
+            return
+        now = time.time()
+        ids = {
+            os.path.splitext(name)[0]
+            for name in entries
+            if name.endswith(".json") or name.endswith(".bin")
+        }
+        for transfer_id in ids:
+            meta_path = os.path.join(directory, transfer_id + ".json")
+            data_path = os.path.join(directory, transfer_id + ".bin")
+            try:
+                reference_mtime = max(
+                    os.path.getmtime(path)
+                    for path in (meta_path, data_path)
+                    if os.path.exists(path)
+                )
+            except (OSError, ValueError):
+                continue
+            complete_pair = os.path.isfile(meta_path) and os.path.isfile(data_path)
+            expired = now - reference_mtime > OUTBOX_TTL_SECONDS
+            orphaned = not complete_pair and now - reference_mtime > 60 * 60
+            if not expired and not orphaned:
+                continue
+            for path in (meta_path, data_path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _inbound_receipt_path(self, kind: str, delivery_id: str) -> Optional[str]:
         if kind not in ("message", "file"):
@@ -1163,7 +1258,7 @@ class Agent:
         if path is None:
             return False
         try:
-            if time.time() - os.path.getmtime(path) > 7 * 24 * 60 * 60:
+            if time.time() - os.path.getmtime(path) > OUTBOX_TTL_SECONDS:
                 os.unlink(path)
                 return False
             return os.path.isfile(path)
@@ -1283,8 +1378,19 @@ class Agent:
         data_tmp = f"{data_path}.tmp.{os.getpid()}"
         meta_tmp = f"{meta_path}.tmp.{os.getpid()}"
         try:
-            shutil.copyfile(path, data_tmp)
-            os.chmod(data_tmp, 0o600)
+            linked = False
+            try:
+                os.link(path, data_tmp)
+                linked = True
+            except OSError:
+                shutil.copyfile(path, data_tmp)
+            # chmod on a hard link also changes the generated source file.
+            # The 0700 outbox directory already protects the spool name, so
+            # preserve the source inode's permissions when hard-linking.
+            if not linked:
+                os.chmod(data_tmp, 0o600)
+                with open(data_tmp, "rb+") as data_fh:
+                    os.fsync(data_fh.fileno())
             with open(meta_tmp, "w", encoding="utf-8") as fh:
                 json.dump(
                     {
@@ -1302,6 +1408,14 @@ class Agent:
             os.chmod(meta_tmp, 0o600)
             os.replace(data_tmp, data_path)
             os.replace(meta_tmp, meta_path)
+            try:
+                dir_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
         finally:
             for tmp in (data_tmp, meta_tmp):
                 try:
@@ -1312,12 +1426,15 @@ class Agent:
     def _ack_outbound_file(self, transfer_id: str) -> None:
         if not re.fullmatch(r"[A-Za-z0-9-]{8,80}", transfer_id):
             return
+        removed = False
         for suffix in (".json", ".bin"):
             try:
                 os.unlink(os.path.join(self._outbox_dir(), transfer_id + suffix))
+                removed = True
             except OSError:
                 pass
-        log.info("outbound file acknowledged transfer=%s", transfer_id[:12])
+        if removed:
+            log.info("outbound file acknowledged transfer=%s", transfer_id[:12])
 
     async def _replay_outbox(self, session_id: str) -> None:
         if self._outbox_replay_lock.locked():
@@ -1904,12 +2021,24 @@ class Agent:
                     lines = fh.readlines()[-160:]
             except (OSError, UnicodeError):
                 continue
+            parsed_entries = []
             for line in lines:
                 try:
                     entry = json.loads(line)
                 except (TypeError, ValueError):
                     continue
-                if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                if isinstance(entry, dict):
+                    parsed_entries.append(entry)
+            last_user_index = max(
+                (
+                    index
+                    for index, entry in enumerate(parsed_entries)
+                    if entry.get("role") == "user"
+                ),
+                default=-1,
+            )
+            for entry in parsed_entries[last_user_index + 1 :]:
+                if entry.get("role") != "assistant":
                     continue
                 calls = entry.get("tool_calls")
                 if not isinstance(calls, list):
@@ -1949,13 +2078,43 @@ class Agent:
                         if os.path.isfile(resolved):
                             path = resolved
                             break
+                    if not path and not os.path.isabs(raw_path):
+                        requested_name = os.path.basename(raw_path)
+                        requested_stem, requested_suffix = os.path.splitext(requested_name)
+                        requested_key = re.sub(
+                            r"[\W_]+", "_", requested_stem, flags=re.UNICODE
+                        ).strip("_").casefold()
+                        inbox = os.path.join(workspace, "inbox")
+                        try:
+                            inbox_entries = os.listdir(inbox)
+                        except OSError:
+                            inbox_entries = []
+                        matches = []
+                        for entry_name in inbox_entries:
+                            entry_stem, entry_suffix = os.path.splitext(entry_name)
+                            if entry_suffix.lower() != requested_suffix.lower():
+                                continue
+                            versionless_stem = re.sub(r"-\d+$", "", entry_stem)
+                            entry_key = re.sub(
+                                r"[\W_]+", "_", versionless_stem, flags=re.UNICODE
+                            ).strip("_").casefold()
+                            if entry_key != requested_key:
+                                continue
+                            resolved = os.path.realpath(os.path.join(inbox, entry_name))
+                            if (
+                                xfer.is_approved_outbound_path(resolved, workspace)
+                                and os.path.isfile(resolved)
+                            ):
+                                matches.append((os.path.getmtime(resolved), resolved))
+                        if matches:
+                            path = max(matches)[1]
                     if not path:
                         continue
                     try:
                         st = os.stat(path)
                     except OSError:
                         continue
-                    if not stat.S_ISREG(st.st_mode) or st.st_mtime + 2 < started:
+                    if not stat.S_ISREG(st.st_mode):
                         continue
                     if path in state.pushed_paths:
                         continue
@@ -2040,6 +2199,7 @@ class Agent:
         recovered = False
         for requested_name in requested_names:
             stem, suffix = os.path.splitext(requested_name)
+            requested_key = re.sub(r"[\W_]+", "_", stem, flags=re.UNICODE).strip("_").casefold()
             try:
                 entries = os.listdir(inbox)
             except OSError:
@@ -2048,9 +2208,11 @@ class Agent:
                 entry_stem, entry_suffix = os.path.splitext(entry_name)
                 if entry_suffix.lower() != suffix.lower():
                     continue
-                if entry_stem != stem and not re.fullmatch(
-                    re.escape(stem) + r"-\d+", entry_stem
-                ):
+                versionless_stem = re.sub(r"-\d+$", "", entry_stem)
+                entry_key = re.sub(
+                    r"[\W_]+", "_", versionless_stem, flags=re.UNICODE
+                ).strip("_").casefold()
+                if entry_key != requested_key:
                     continue
                 path = os.path.realpath(os.path.join(inbox, entry_name))
                 if not xfer.is_approved_outbound_path(path, workspace):
@@ -2470,6 +2632,9 @@ class Agent:
                     backoff = MIN_BACKOFF
                     log.info("relay connected mode=%s", self.mode)
                     await self.check_pico_reachable()
+                    await self.ensure_recent_pico_session()
+                    if self.last_session_id:
+                        await self._replay_outbox(self.last_session_id)
                     async for message in ws:
                         if self._reconnect_event.is_set():
                             self._reconnect_event.clear()
@@ -2489,15 +2654,9 @@ class Agent:
                 self.relay = None
                 self.relay_connected = False
                 self.relay_connecting = False
-                # Relay disconnect must not leave permanent busy / cancel leftovers.
-                for sid in list(self.sessions.keys()):
-                    try:
-                        await self.sessions[sid].close()
-                    except Exception:
-                        pass
-                self.sessions.clear()
-                self.ack_capable_sessions.clear()
-                self.clear_all_session_state()
+                # Do not close local Pico sessions here. Scheduled jobs must
+                # continue to be captured and queued while the public Relay is
+                # unavailable. close_all() still closes them on real shutdown.
             if self._stop.is_set():
                 break
             self._reconnect_event.clear()
@@ -2520,7 +2679,10 @@ class Agent:
     async def pico_watchdog(self) -> None:
         while not self._stop.is_set():
             try:
-                await self.check_pico_reachable()
+                if await self.check_pico_reachable():
+                    await self.ensure_recent_pico_session()
+                if self.relay_connected and self.last_session_id:
+                    await self._replay_outbox(self.last_session_id)
             except Exception:
                 pass
             await self._sleep_or_stop(15)
