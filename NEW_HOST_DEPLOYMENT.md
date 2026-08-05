@@ -155,6 +155,7 @@ S99tsingpaws-bridge
 - 真实 Token 保存在 PicoClaw 的 `.security.yml`。
 - `/etc/tsingpaws-agent.env` 中的 `PICO_TOKEN` 只作为回退值，必须与 `.security.yml` 一致。
 - `/etc/tsingpaws-agent.env` 必须设置 `PICO_SECURITY_FILE=/opt/tsingpaw/data/.security.yml`。
+- `/etc/tsingpaws-agent.env` 必须设置 `LAUNCHER_API_BASE=http://127.0.0.1:18880`；如果 Launcher 管理口令与 Pico 通道 Token 不同，还必须单独设置 `LAUNCHER_TOKEN`。
 - `run-bridge.sh` 必须显式导出 `PICO_SECURITY_FILE`；仅在 env 文件中赋值但不导出，Python Bridge 进程读取不到。
 - `/etc/tsingpaw.conf` 不要再设置 `PICOCLAW_CHANNELS_PICO_TOKEN`，防止启动时覆盖正确令牌。
 - 不要在日志、截图、Git 或部署记录中打印真实 Token。

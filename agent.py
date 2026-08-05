@@ -24,21 +24,23 @@ import signal
 import socket
 import stat
 import sys
+import threading
 import time
 import uuid
+from http.cookiejar import CookieJar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Set, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse, urlunparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from websockets.exceptions import ConnectionClosed
 from websockets.legacy.client import connect as ws_connect
 
 import file_transfer as xfer
 
-AGENT_VERSION = "2.4.0-scheduled-delivery"
+AGENT_VERSION = "2.4.4-storage-ack"
 MAX_MESSAGE_SIZE = 4 * 1024 * 1024
 MIN_BACKOFF = 2.0
 MAX_BACKOFF = 30.0
@@ -47,6 +49,14 @@ OUTBOX_TTL_SECONDS = 30 * 24 * 60 * 60
 STATUS_HOST = "127.0.0.1"
 TZ_CN = timezone(timedelta(hours=8))
 SESSION_TASK_TIMEOUT = 20 * 60  # image gen can exceed 8m; typing.start refreshes idle timer
+SCHEDULED_RUN_POLL_SECONDS = 2.0
+SCHEDULED_EMPTY_RESPONSE_MARKERS = (
+    "scheduled task failed: the agent returned no response",
+    "scheduled agent task returned an empty response",
+)
+SCHEDULED_FAILURE_MESSAGE_ZH = (
+    "定时任务执行失败：TsingPaws 未返回有效结果，请稍后重试或检查任务设置。"
+)
 
 MODE_SINGLE = "single_node"
 MODE_INTERNAL = "internal_test"
@@ -62,6 +72,66 @@ FILE_MSG_TYPES = frozenset({"file.start", "file.chunk", "file.end"})
 FILE_ACK_TYPE = "file.ack"
 MESSAGE_ACK_TYPE = "message.ack"
 
+CONTROL_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+CONTROL_MAX_UPLOAD_BYTES = 3 * 1024 * 1024
+CONTROL_ALLOWED_REQUESTS = tuple(
+    (method, re.compile(pattern))
+    for method, pattern in (
+        ("GET", r"^/api/models$"),
+        ("POST", r"^/api/models$"),
+        ("PUT", r"^/api/models/[^/?]+$"),
+        ("DELETE", r"^/api/models/[^/?]+$"),
+        ("POST", r"^/api/models/default$"),
+        ("GET", r"^/api/image-generation$"),
+        ("PUT", r"^/api/image-generation$"),
+        ("POST", r"^/api/image-generation/test$"),
+        ("GET", r"^/api/skills(?:/[^/?]+)?$"),
+        ("POST", r"^/api/skills/import$"),
+        ("PUT", r"^/api/skills/[^/?]+/state$"),
+        ("DELETE", r"^/api/skills/[^/?]+$"),
+        ("GET", r"^/api/experts(?:/[^/?]+)?$"),
+        ("POST", r"^/api/experts/import$"),
+        ("DELETE", r"^/api/experts/[^/?]+$"),
+        ("GET", r"^/api/automation/jobs$"),
+        ("POST", r"^/api/automation/jobs$"),
+        ("PATCH", r"^/api/automation/jobs/[^/?]+$"),
+        ("DELETE", r"^/api/automation/jobs/[^/?]+$"),
+        ("GET", r"^/api/automation/runs$"),
+        ("DELETE", r"^/api/automation/runs$"),
+        ("DELETE", r"^/api/automation/runs/[^/?]+$"),
+        ("GET", r"^/api/tools$"),
+        ("PUT", r"^/api/tools/[^/?]+/state$"),
+        ("GET", r"^/api/channels/catalog$"),
+        ("GET", r"^/api/channels/[^/?]+/doc$"),
+        ("GET", r"^/api/config$"),
+        ("PATCH", r"^/api/config$"),
+        ("POST", r"^/api/config/test-command-patterns$"),
+        ("GET", r"^/api/integrations/google/status$"),
+        ("POST", r"^/api/integrations/google/(?:client-secret|credentials)$"),
+        ("GET", r"^/api/integrations/tencent-meeting/status$"),
+        ("POST", r"^/api/integrations/tencent-meeting/(?:token|test)$"),
+        ("DELETE", r"^/api/integrations/tencent-meeting/token$"),
+        ("GET", r"^/api/monitor/performance$"),
+        ("GET", r"^/api/monitor/logs$"),
+        ("GET", r"^/api/monitor/logs/[^/?]+$"),
+        ("GET", r"^/api/usage/stats$"),
+        ("GET", r"^/api/gateway/status$"),
+        ("POST", r"^/api/gateway/(?:start|stop|restart)$"),
+        ("GET", r"^/api/system/(?:autostart|launcher-config|runtime-timezone)$"),
+        ("PUT", r"^/api/system/launcher-config$"),
+        ("POST", r"^/api/(?:weixin|wecom)/flows$"),
+        ("GET", r"^/api/(?:weixin|wecom)/flows/[^/?]+$"),
+        ("GET", r"^/api/(?:whatsapp_native|telegram)/status$"),
+        ("POST", r"^/api/whatsapp_native/refresh$"),
+    )
+)
+CONTROL_CONFIRM_PATHS = (
+    re.compile(r"^/api/gateway/(?:stop|restart)$"),
+    re.compile(r"^/api/models/[^/?]+$"),
+    re.compile(r"^/api/(?:skills|experts)/[^/?]+$"),
+    re.compile(r"^/api/integrations/tencent-meeting/token$"),
+)
+
 PAIRING_CODE_RE = re.compile(r"^\d{6}$")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -69,6 +139,13 @@ log = logging.getLogger("tsingpaws-agent")
 
 # Secrets that must never reach the log or any API response.
 _SECRETS: set = set()
+
+# Launcher uses a cookie-backed login session.  Keep one authenticated session
+# and serialize access to it: the Launcher invalidates/replaces sessions when
+# several login requests arrive at the same time.
+_LAUNCHER_SESSION_LOCK = threading.RLock()
+_LAUNCHER_OPENER = None
+_LAUNCHER_SESSION_BASE = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +272,11 @@ def _pico_security_token() -> str:
 
 def pico_token() -> str:
     return _pico_security_token() or env("PICO_TOKEN")
+
+
+def launcher_token() -> str:
+    """Launcher management credential, separate from the Pico channel token."""
+    return env("LAUNCHER_TOKEN") or pico_token()
 
 
 def pico_ws_path() -> str:
@@ -473,6 +555,191 @@ def http_json(
         return int(exc.code), body if isinstance(body, dict) else {}, dict(exc.headers or {})
     except (URLError, OSError, ValueError) as exc:
         return 0, {"error": "network_error", "detail": sanitize_error(exc) or "unreachable"}, {}
+
+
+def launcher_api_base() -> str:
+    """Return the loopback-only Launcher API origin used by APP control RPC."""
+    raw = env("LAUNCHER_API_BASE", "http://127.0.0.1:18880").rstrip("/")
+    parsed = urlparse(raw)
+    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("LAUNCHER_API_BASE must use loopback HTTP")
+    return raw
+
+
+def control_request_allowed(method: str, path: str) -> bool:
+    parsed = urlparse(path)
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/api/"):
+        return False
+    if parsed.query:
+        if method != "GET":
+            return False
+        allowed_query_keys: Set[str]
+        if parsed.path == "/api/usage/stats":
+            allowed_query_keys = {"days"}
+        elif parsed.path == "/api/automation/runs":
+            allowed_query_keys = {"offset", "limit"}
+        elif parsed.path.startswith("/api/monitor/logs/"):
+            allowed_query_keys = {"lines", "level", "search"}
+        elif parsed.path.startswith("/api/channels/") and parsed.path.endswith("/doc"):
+            allowed_query_keys = {"lang"}
+        else:
+            return False
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        if any(key not in allowed_query_keys for key, _ in pairs):
+            return False
+    return any(
+        allowed_method == method and pattern.fullmatch(parsed.path)
+        for allowed_method, pattern in CONTROL_ALLOWED_REQUESTS
+    )
+
+
+def control_request_needs_confirmation(method: str, path: str) -> bool:
+    parsed_path = urlparse(path).path
+    if method == "DELETE" and any(pattern.fullmatch(parsed_path) for pattern in CONTROL_CONFIRM_PATHS):
+        return True
+    return parsed_path in ("/api/gateway/stop", "/api/gateway/restart")
+
+
+def _control_sensitive_key(key: str) -> bool:
+    normalized = key.lower().strip()
+    if normalized in ("token_url", "token_path", "token_updated_at"):
+        return False
+    if normalized.endswith("_tokens") or normalized in (
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "max_tokens",
+    ):
+        return False
+    return normalized in (
+        "api_key",
+        "token",
+        "password",
+        "authorization",
+        "credentials",
+        "client_secret",
+        "master_secret",
+    ) or normalized.endswith(("_api_key", "_password", "_secret"))
+
+
+def sanitize_control_payload(value: Any) -> Any:
+    """Recursively remove credentials before data can leave the device."""
+    if isinstance(value, list):
+        return [sanitize_control_payload(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result: Dict[str, Any] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key)
+        if _control_sensitive_key(key):
+            configured_key = key + "_configured"
+            if configured_key not in value and configured_key not in result:
+                result[configured_key] = bool(raw_value)
+            continue
+        result[key] = sanitize_control_payload(raw_value)
+    return result
+
+
+def _multipart_body(spec: Dict[str, Any]) -> Tuple[bytes, str]:
+    field = str(spec.get("field") or "file")[:80]
+    filename = os.path.basename(str(spec.get("name") or "upload.bin"))[:180]
+    content_type = str(spec.get("content_type") or "application/octet-stream")[:120]
+    encoded = spec.get("data_base64")
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError("missing upload data")
+    try:
+        raw = __import__("base64").b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError("invalid upload data") from exc
+    if not raw or len(raw) > CONTROL_MAX_UPLOAD_BYTES:
+        raise ValueError("upload size must be between 1 byte and 3 MB")
+    boundary = "----TsingPawsApp" + uuid.uuid4().hex
+    header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode("utf-8")
+    body = header + raw + f"\r\n--{boundary}--\r\n".encode("ascii")
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def launcher_control_request(
+    method: str,
+    path: str,
+    body: Optional[Dict[str, Any]] = None,
+    multipart: Optional[Dict[str, Any]] = None,
+    timeout: float = 35.0,
+) -> Tuple[int, Any]:
+    """Call the local Launcher through a shared, authenticated cookie session."""
+    if not control_request_allowed(method, path):
+        return 403, {"error": "operation_not_allowed"}
+    token = launcher_token()
+    if not token:
+        return 503, {"error": "launcher_token_unavailable"}
+    remember_secret(token)
+    data: Optional[bytes] = None
+    headers = {"Accept": "application/json, text/plain"}
+    if multipart is not None:
+        try:
+            data, content_type = _multipart_body(multipart)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        headers["Content-Type"] = content_type
+    elif body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    base = launcher_api_base()
+
+    def authenticate():
+        opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        login = Request(
+            base + "/api/auth/login",
+            data=json.dumps({"token": token}).encode("utf-8"),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(login, timeout=min(timeout, 10.0)) as response:
+            response.read(CONTROL_MAX_RESPONSE_BYTES + 1)
+        return opener
+
+    global _LAUNCHER_OPENER, _LAUNCHER_SESSION_BASE
+    with _LAUNCHER_SESSION_LOCK:
+        for attempt in range(2):
+            try:
+                if _LAUNCHER_OPENER is None or _LAUNCHER_SESSION_BASE != base:
+                    _LAUNCHER_OPENER = authenticate()
+                    _LAUNCHER_SESSION_BASE = base
+                request = Request(base + path, data=data, headers=headers, method=method)
+                with _LAUNCHER_OPENER.open(request, timeout=timeout) as response:
+                    raw = response.read(CONTROL_MAX_RESPONSE_BYTES + 1)
+                    if len(raw) > CONTROL_MAX_RESPONSE_BYTES:
+                        return 413, {"error": "response_too_large"}
+                    content_type = (response.headers.get("Content-Type") or "").lower()
+                    if "json" in content_type:
+                        parsed = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+                    else:
+                        parsed = {"text": raw.decode("utf-8", errors="replace")}
+                    return int(getattr(response, "status", 200)), sanitize_control_payload(parsed)
+            except HTTPError as exc:
+                if exc.code in (401, 403) and attempt == 0:
+                    _LAUNCHER_OPENER = None
+                    _LAUNCHER_SESSION_BASE = ""
+                    continue
+                raw = exc.read(CONTROL_MAX_RESPONSE_BYTES + 1)
+                try:
+                    parsed = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+                except ValueError:
+                    parsed = {"error": raw.decode("utf-8", errors="replace")[:500]}
+                error = "launcher_auth_failed" if exc.code in (401, 403) else None
+                if error and not parsed.get("error"):
+                    parsed["error"] = error
+                return int(exc.code), sanitize_control_payload(parsed)
+            except (URLError, OSError, ValueError) as exc:
+                _LAUNCHER_OPENER = None
+                _LAUNCHER_SESSION_BASE = ""
+                return 0, {"error": "launcher_unreachable", "detail": sanitize_error(exc)}
+
+    return 401, {"error": "launcher_auth_failed"}
 
 
 def relay_health() -> Tuple[bool, Dict[str, Any]]:
@@ -790,6 +1057,7 @@ class SessionState:
     timeout_handle: Optional[asyncio.TimerHandle] = None
     pushed_paths: Set[str] = field(default_factory=set)
     task_started_at: float = 0.0
+    task_finished_at: float = 0.0
 
 
 class PicoSession:
@@ -877,6 +1145,8 @@ class Agent:
         self._claim_lock = asyncio.Lock()
         self._binding_status_lock = asyncio.Lock()
         self._outbox_replay_lock = asyncio.Lock()
+        self._scheduled_delivery_lock = asyncio.Lock()
+        self._recent_scheduled_delivery: Dict[str, float] = {}
         self.started_at = time.time()
         self.mode = read_mode()
         self.identity = load_identity()
@@ -903,9 +1173,281 @@ class Agent:
             workspace=pico_workspace(),
             send_error=self._transfer_error_cb,
         )
+        self._scheduled_delivery_ids = self._load_scheduled_delivery_ids()
 
     async def _transfer_error_cb(self, session_id: str, payload: Dict[str, Any]) -> None:
         await self.send_to_app(make_envelope("error", session_id, payload))
+
+    # ---- scheduled attachment reconciliation ----
+
+    def _scheduled_runs_file(self) -> str:
+        return os.path.join(pico_workspace(), "cron", "runs.json")
+
+    def _scheduled_jobs_file(self) -> str:
+        return os.path.join(pico_workspace(), "cron", "jobs.json")
+
+    def _scheduled_delivery_file(self) -> str:
+        return os.path.join(conf_dir(), "scheduled-delivery.json")
+
+    def _load_scheduled_delivery_ids(self) -> Set[str]:
+        """Load the durable run ledger, baselining runs that predate this feature."""
+        path = self._scheduled_delivery_file()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+            values = document.get("run_ids") if isinstance(document, dict) else None
+            if isinstance(values, list):
+                return {
+                    str(value)
+                    for value in values[-2000:]
+                    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,120}", value)
+                }
+        except (OSError, ValueError):
+            pass
+
+        # Do not replay historical failures when this feature is first installed.
+        baseline: Set[str] = set()
+        try:
+            with open(self._scheduled_runs_file(), "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+            runs = document.get("runs") if isinstance(document, dict) else None
+            if isinstance(runs, list):
+                baseline = {
+                    str(item.get("run_id"))
+                    for item in runs
+                    if isinstance(item, dict)
+                    and re.fullmatch(r"[A-Za-z0-9_-]{8,120}", str(item.get("run_id") or ""))
+                }
+        except (OSError, ValueError):
+            pass
+        self._save_scheduled_delivery_ids(baseline)
+        return baseline
+
+    def _save_scheduled_delivery_ids(self, run_ids: Set[str]) -> None:
+        path = self._scheduled_delivery_file()
+        directory = os.path.dirname(path)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"version": 1, "run_ids": sorted(run_ids)[-2000:]},
+                    fh,
+                    ensure_ascii=False,
+                )
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _scheduled_destination(run: Dict[str, Any]) -> str:
+        target = str(run.get("to") or "")
+        if target.startswith("pico:"):
+            target = target[5:]
+        return target if re.fullmatch(r"[A-Za-z0-9._:-]{8,200}", target) else ""
+
+    @staticmethod
+    def _is_scheduled_empty_response(content: str) -> bool:
+        value = content.casefold()
+        return any(marker in value for marker in SCHEDULED_EMPTY_RESPONSE_MARKERS)
+
+    async def _scheduled_failure_was_reconciled(
+        self, session_id: str, *, timeout: float = 4.0
+    ) -> bool:
+        """Briefly hold Pico's false failure while its run record is being persisted."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            await self._reconcile_scheduled_runs_once()
+            if time.time() - self._recent_scheduled_delivery.get(session_id, 0) < 120:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.25)
+
+    def _scheduled_session_content(self, job_id: str, message: str) -> str:
+        path = os.path.join(
+            pico_workspace(), "sessions", f"agent_main_cron_{job_id}.jsonl"
+        )
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                entries = [
+                    json.loads(line)
+                    for line in fh.readlines()[-240:]
+                    if line.strip()
+                ]
+        except (OSError, ValueError, UnicodeError):
+            return ""
+        last_user = max(
+            (
+                index
+                for index, entry in enumerate(entries)
+                if isinstance(entry, dict)
+                and entry.get("role") == "user"
+                and str(entry.get("content") or "") == message
+            ),
+            default=-1,
+        )
+        if last_user < 0:
+            return ""
+        return "\n".join(
+            str(entry.get("content") or "")
+            for entry in entries[last_user + 1 :]
+            if isinstance(entry, dict) and entry.get("role") == "assistant"
+        )
+
+    def _mark_scheduled_run_success(self, run_id: str, job_id: str, delivered_at_ms: int) -> None:
+        """Correct Pico's attachment-only false failure without changing schedules."""
+        runs_path = self._scheduled_runs_file()
+        try:
+            with open(runs_path, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+            runs = document.get("runs") if isinstance(document, dict) else None
+            changed = False
+            if isinstance(runs, list):
+                for item in runs:
+                    if not isinstance(item, dict) or str(item.get("run_id") or "") != run_id:
+                        continue
+                    item["status"] = "ok"
+                    item.pop("error", None)
+                    item["result"] = "Scheduled attachment delivered successfully."
+                    item["delivery_status"] = "delivered"
+                    item["delivered_at_ms"] = delivered_at_ms
+                    changed = True
+                    break
+            if changed:
+                self._atomic_json_replace(runs_path, document)
+        except (OSError, ValueError):
+            log.warning("could not correct scheduled run status run=%s", run_id[:12])
+
+        jobs_path = self._scheduled_jobs_file()
+        try:
+            with open(jobs_path, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+            jobs = document.get("jobs") if isinstance(document, dict) else None
+            changed = False
+            if isinstance(jobs, list):
+                for item in jobs:
+                    if not isinstance(item, dict) or str(item.get("id") or "") != job_id:
+                        continue
+                    state = item.get("state")
+                    if isinstance(state, dict) and state.get("lastStatus") == "error":
+                        state["lastStatus"] = "ok"
+                        state.pop("lastError", None)
+                        changed = True
+                    break
+            if changed:
+                self._atomic_json_replace(jobs_path, document)
+        except (OSError, ValueError):
+            log.warning("could not correct scheduled job status job=%s", job_id[:12])
+
+    @staticmethod
+    def _atomic_json_replace(path: str, document: Dict[str, Any]) -> None:
+        tmp = f"{path}.tmp.tsingpaws-agent.{os.getpid()}"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(document, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    async def _reconcile_scheduled_runs_once(self) -> int:
+        if self._scheduled_delivery_lock.locked():
+            return 0
+        async with self._scheduled_delivery_lock:
+            try:
+                with open(self._scheduled_runs_file(), "r", encoding="utf-8") as fh:
+                    document = json.load(fh)
+            except (OSError, ValueError):
+                return 0
+            runs = document.get("runs") if isinstance(document, dict) else None
+            if not isinstance(runs, list):
+                return 0
+            recovered_count = 0
+            for run in runs:
+                if not isinstance(run, dict):
+                    continue
+                run_id = str(run.get("run_id") or "")
+                job_id = str(run.get("job_id") or "")
+                error = str(run.get("error") or "")
+                if (
+                    run_id in self._scheduled_delivery_ids
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{8,120}", run_id)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{8,120}", job_id)
+                    or run.get("status") != "error"
+                    or not self._is_scheduled_empty_response(error)
+                ):
+                    continue
+                destination = self._scheduled_destination(run)
+                started_ms = int(run.get("started_at_ms") or 0)
+                finished_ms = int(run.get("finished_at_ms") or 0)
+                if not destination or started_ms <= 0 or finished_ms < started_ms:
+                    continue
+                state = SessionState(
+                    task_started_at=started_ms / 1000.0,
+                    task_finished_at=finished_ms / 1000.0,
+                )
+                content = self._scheduled_session_content(
+                    job_id, str(run.get("message") or "")
+                )
+                try:
+                    await self._push_content_file_refs(destination, content, state)
+                    await self._push_send_file_fallback(
+                        destination, state, source_session_id=job_id
+                    )
+                    await self._push_generated_document_fallback(
+                        destination, state, source_session_id=job_id
+                    )
+                    await self._push_generated_image_fallback(
+                        destination, content, state, force=True
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "scheduled attachment recovery failed run=%s err=%s",
+                        run_id[:12],
+                        redact(str(exc)),
+                    )
+                    continue
+                if not state.pushed_paths:
+                    continue
+                delivered_at_ms = int(time.time() * 1000)
+                self._scheduled_delivery_ids.add(run_id)
+                await asyncio.to_thread(
+                    self._save_scheduled_delivery_ids, self._scheduled_delivery_ids
+                )
+                await asyncio.to_thread(
+                    self._mark_scheduled_run_success,
+                    run_id,
+                    job_id,
+                    delivered_at_ms,
+                )
+                self._recent_scheduled_delivery[destination] = time.time()
+                recovered_count += 1
+                log.info(
+                    "reconciled scheduled attachment run=%s job=%s session=%s",
+                    run_id[:12],
+                    job_id[:12],
+                    destination,
+                )
+            return recovered_count
+
+    async def scheduled_delivery_watchdog(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._reconcile_scheduled_runs_once()
+            except Exception as exc:
+                log.warning("scheduled delivery watchdog error=%s", redact(str(exc)))
+            await self._sleep_or_stop(SCHEDULED_RUN_POLL_SECONDS)
 
     # ---- identity helpers ----
 
@@ -1028,6 +1570,8 @@ class Agent:
         state = self.touch_session(session_id)
         state.busy = True
         state.task_started_at = time.time()
+        state.task_finished_at = 0.0
+        state.pushed_paths.clear()
         state.cancel_event = asyncio.Event()
         await self.typing_start(session_id)
         self._arm_session_timeout(session_id)
@@ -1436,6 +1980,33 @@ class Agent:
         if removed:
             log.info("outbound file acknowledged transfer=%s", transfer_id[:12])
 
+    def _mark_outbound_file_retryable(self, transfer_id: str) -> None:
+        """Make a Relay-rejected transfer eligible for the next reconnect replay."""
+        if not re.fullmatch(r"[A-Za-z0-9-]{8,80}", transfer_id):
+            return
+        meta_path = os.path.join(self._outbox_dir(), transfer_id + ".json")
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            if not isinstance(meta, dict):
+                return
+            meta["last_sent_at"] = 0
+            tmp = f"{meta_path}.tmp.{os.getpid()}"
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(meta, fh, ensure_ascii=False)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, meta_path)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        except (OSError, ValueError, TypeError):
+            return
+
     async def _replay_outbox(self, session_id: str) -> None:
         if self._outbox_replay_lock.locked():
             return
@@ -1540,6 +2111,69 @@ class Agent:
             await self._close_pico_session(session_id)
             raise
 
+    async def _handle_control_request(self, session_id: str, obj: Dict[str, Any]) -> None:
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        request_id = str(payload.get("request_id") or obj.get("id") or "")[:120]
+        method = str(payload.get("method") or "GET").upper()
+        path = str(payload.get("path") or "")[:500]
+        body = payload.get("body") if isinstance(payload.get("body"), dict) else None
+        multipart = payload.get("multipart") if isinstance(payload.get("multipart"), dict) else None
+        confirm = payload.get("confirm") is True
+        if not request_id or not control_request_allowed(method, path):
+            await self.send_to_app(
+                make_envelope(
+                    "control.response",
+                    session_id,
+                    {
+                        "request_id": request_id,
+                        "ok": False,
+                        "status": 403,
+                        "error": "operation_not_allowed",
+                    },
+                )
+            )
+            return
+        if control_request_needs_confirmation(method, path) and not confirm:
+            await self.send_to_app(
+                make_envelope(
+                    "control.response",
+                    session_id,
+                    {
+                        "request_id": request_id,
+                        "ok": False,
+                        "status": 409,
+                        "error": "confirmation_required",
+                    },
+                )
+            )
+            return
+        status, result = await asyncio.to_thread(
+            launcher_control_request,
+            method,
+            path,
+            body,
+            multipart,
+        )
+        response: Dict[str, Any] = {
+            "request_id": request_id,
+            "ok": 200 <= status < 300,
+            "status": status,
+        }
+        if 200 <= status < 300:
+            response["data"] = result
+        else:
+            if isinstance(result, dict):
+                response["error"] = str(
+                    result.get("message")
+                    or result.get("error")
+                    or result.get("detail")
+                    or "request_failed"
+                )[:500]
+                response["details"] = result
+            else:
+                response["error"] = "request_failed"
+        await self.send_to_app(make_envelope("control.response", session_id, response))
+
     async def handle_relay_message(self, message: Any) -> None:
         if isinstance(message, bytes):
             try:
@@ -1561,6 +2195,20 @@ class Agent:
             if kind == "relay.peer_offline":
                 log.info("relay peer offline")
                 return
+            if kind == "relay.storage_error":
+                error_payload = (
+                    obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                )
+                transfer_id = error_payload.get("transfer_id")
+                if isinstance(transfer_id, str):
+                    self._mark_outbound_file_retryable(transfer_id)
+                    log.warning(
+                        "Relay 暂存文件失败，已保留文件等待自动重试 transfer=%s",
+                        transfer_id[:12],
+                    )
+                else:
+                    log.warning("Relay 暂存消息失败，已保留本地重发副本")
+                return
             if kind in ("relay.device_online", "relay.device_offline", "relay.pairing_claimed"):
                 log.info("relay event type=%s", kind)
                 return
@@ -1577,6 +2225,31 @@ class Agent:
                 await self.send_to_app(
                     make_envelope("device.status.response", session_id, status)
                 )
+                return
+            if kind == "control.request":
+                if not session_id:
+                    log.warning("control request missing session_id")
+                    return
+                try:
+                    await self._handle_control_request(session_id, obj)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("control request failed err=%s", redact(str(exc)))
+                    request_payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                    request_id = str(request_payload.get("request_id") or obj.get("id") or "")[:120]
+                    await self.send_to_app(
+                        make_envelope(
+                            "control.response",
+                            session_id,
+                            {
+                                "request_id": request_id,
+                                "ok": False,
+                                "status": 500,
+                                "error": "internal_error",
+                            },
+                        )
+                    )
                 return
             if kind == MESSAGE_ACK_TYPE:
                 payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
@@ -1847,6 +2520,15 @@ class Agent:
             if payload.get("thought") is True:
                 log.info("skip thought message session=%s", session_id)
                 return
+            content = payload.get("content")
+            if isinstance(content, str) and self._is_scheduled_empty_response(content):
+                if await self._scheduled_failure_was_reconciled(session_id):
+                    log.info("suppressed false scheduled failure session=%s", session_id)
+                    return
+                obj = dict(obj)
+                payload = dict(payload)
+                payload["content"] = SCHEDULED_FAILURE_MESSAGE_ZH
+                obj["payload"] = payload
             await self._handle_pico_message_create(session_id, obj, payload)
             return
 
@@ -1908,6 +2590,7 @@ class Agent:
             await self._push_pico_attachments(session_id, payload, state)
             await self._push_content_file_refs(session_id, content if isinstance(content, str) else "", state)
             await self._push_send_file_fallback(session_id, state)
+            await self._push_generated_document_fallback(session_id, state)
             await self._push_generated_image_fallback(
                 session_id, content if isinstance(content, str) else "", state
             )
@@ -1969,7 +2652,14 @@ class Agent:
             if not path:
                 continue
             if not os.path.isabs(path):
-                path = os.path.join(workspace, path)
+                candidates = (
+                    os.path.join(workspace, path),
+                    os.path.join(workspace, "inbox", path),
+                )
+                path = next(
+                    (candidate for candidate in candidates if os.path.isfile(candidate)),
+                    candidates[0],
+                )
             if not xfer.is_approved_outbound_path(path, workspace):
                 log.warning("reject unapproved outbound path session=%s", session_id)
                 continue
@@ -1979,6 +2669,15 @@ class Agent:
                 key = os.path.realpath(path)
             except OSError:
                 continue
+            try:
+                modified = os.path.getmtime(key)
+            except OSError:
+                continue
+            if state.task_finished_at > 0 and (
+                modified + 2 < state.task_started_at
+                or modified > state.task_finished_at + 5
+            ):
+                continue
             if key in state.pushed_paths:
                 continue
             name = xfer.sanitize_filename(os.path.basename(path))
@@ -1987,7 +2686,11 @@ class Agent:
             state.pushed_paths.add(key)
 
     async def _push_send_file_fallback(
-        self, session_id: str, state: SessionState
+        self,
+        session_id: str,
+        state: SessionState,
+        *,
+        source_session_id: Optional[str] = None,
     ) -> bool:
         """Recover files delivered by Pico's send_file tool but omitted from direct-channel events.
 
@@ -2000,9 +2703,10 @@ class Agent:
         if started <= 0:
             return False
         sessions_dir = os.path.join(pico_workspace(), "sessions")
+        log_session_id = source_session_id or session_id
         patterns = (
-            os.path.join(sessions_dir, f"*{session_id}.jsonl"),
-            os.path.join("/root/.picoclaw/workspace/sessions", f"*{session_id}.jsonl"),
+            os.path.join(sessions_dir, f"*{log_session_id}.jsonl"),
+            os.path.join("/root/.picoclaw/workspace/sessions", f"*{log_session_id}.jsonl"),
         )
         session_files = []
         for pattern in patterns:
@@ -2116,6 +2820,11 @@ class Agent:
                         continue
                     if not stat.S_ISREG(st.st_mode):
                         continue
+                    if state.task_finished_at > 0 and (
+                        st.st_mtime + 2 < state.task_started_at
+                        or st.st_mtime > state.task_finished_at + 5
+                    ):
+                        continue
                     if path in state.pushed_paths:
                         continue
                     requested_name = args_obj.get("filename")
@@ -2134,7 +2843,11 @@ class Agent:
         return recovered
 
     async def _push_generated_document_fallback(
-        self, session_id: str, state: SessionState
+        self,
+        session_id: str,
+        state: SessionState,
+        *,
+        source_session_id: Optional[str] = None,
     ) -> bool:
         """Recover documents created by Pico's generate_document tool.
 
@@ -2150,9 +2863,10 @@ class Agent:
             return False
 
         sessions_dir = os.path.join(workspace, "sessions")
+        log_session_id = source_session_id or session_id
         patterns = (
-            os.path.join(sessions_dir, f"*{session_id}.jsonl"),
-            os.path.join("/root/.picoclaw/workspace/sessions", f"*{session_id}.jsonl"),
+            os.path.join(sessions_dir, f"*{log_session_id}.jsonl"),
+            os.path.join("/root/.picoclaw/workspace/sessions", f"*{log_session_id}.jsonl"),
         )
         requested_names: Set[str] = set()
         seen_logs: Set[str] = set()
@@ -2223,6 +2937,8 @@ class Agent:
                     continue
                 if not stat.S_ISREG(st.st_mode) or st.st_mtime + 2 < started:
                     continue
+                if state.task_finished_at > 0 and st.st_mtime > state.task_finished_at + 5:
+                    continue
                 if path in state.pushed_paths:
                     continue
                 name = xfer.sanitize_filename(entry_name)
@@ -2264,6 +2980,8 @@ class Agent:
                     continue
                 mtime = os.path.getmtime(path)
                 if mtime + 2 < started:
+                    continue
+                if state.task_finished_at > 0 and mtime > state.task_finished_at + 5:
                     continue
                 candidates.append((mtime, path))
         except OSError as exc:
@@ -2897,11 +3615,15 @@ async def amain() -> None:
     await status.start()
     relay_task = asyncio.create_task(agent.run_relay_forever(), name="relay-loop")
     watchdog_task = asyncio.create_task(agent.pico_watchdog(), name="pico-watchdog")
+    scheduled_task = asyncio.create_task(
+        agent.scheduled_delivery_watchdog(),
+        name="scheduled-delivery-watchdog",
+    )
     await stop_future
     log.info("shutdown requested")
     await agent.close_all()
     await status.stop()
-    for task in (relay_task, watchdog_task):
+    for task in (relay_task, watchdog_task, scheduled_task):
         task.cancel()
         try:
             await task

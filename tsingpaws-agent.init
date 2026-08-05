@@ -19,6 +19,7 @@ start_service() {
 	procd_set_param command "$WRAPPER"
 	procd_set_param file "$ENV_FILE" "$SCRIPT" "$WRAPPER"
 	procd_set_param respawn 3600 5 5
+	procd_set_param term_timeout 15
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param pidfile /var/run/tsingpaws-agent.pid

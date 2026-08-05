@@ -45,6 +45,8 @@ def conf(tmp_path, monkeypatch):
     monkeypatch.setenv("STATUS_PORT", "18792")
     (conf_dir / "mode").write_text("single_node\n")
     ag._SECRETS.clear()
+    ag._LAUNCHER_OPENER = None
+    ag._LAUNCHER_SESSION_BASE = ""
     yield conf_dir
 
 
@@ -362,6 +364,148 @@ def test_15_status_request_is_local_and_correlated(conf, monkeypatch):
     assert captured[0]["payload"]["lan_ip"] == "192.168.100.12"
 
 
+def test_15_control_allowlist_and_secret_sanitizer(conf):
+    assert ag.control_request_allowed("GET", "/api/models")
+    assert ag.control_request_allowed("PATCH", "/api/config")
+    assert ag.control_request_allowed("GET", "/api/usage/stats?days=30")
+    assert not ag.control_request_allowed("GET", "http://evil.example/api/models")
+    assert not ag.control_request_allowed("GET", "/api/auth/status")
+    assert not ag.control_request_allowed("POST", "/api/gateway/stop?next=http://evil")
+    sanitized = ag.sanitize_control_payload(
+        {
+            "api_key": "secret-value",
+            "token": "token-value",
+            "token_configured": True,
+            "total_tokens": 123,
+            "nested": [{"password": "hidden", "name": "safe"}],
+        }
+    )
+    assert "api_key" not in sanitized
+    assert sanitized["api_key_configured"] is True
+    assert "token" not in sanitized
+    assert sanitized["token_configured"] is True
+    assert sanitized["total_tokens"] == 123
+    assert sanitized["nested"] == [{"password_configured": True, "name": "safe"}]
+
+
+def test_15a_launcher_control_uses_the_internal_launcher_port(conf, monkeypatch):
+    monkeypatch.delenv("LAUNCHER_API_BASE", raising=False)
+    assert ag.launcher_api_base() == "http://127.0.0.1:18880"
+
+    monkeypatch.setenv("LAUNCHER_API_BASE", "http://127.0.0.1:19999/")
+    assert ag.launcher_api_base() == "http://127.0.0.1:19999"
+
+    monkeypatch.setenv("LAUNCHER_API_BASE", "http://example.com:18880")
+    with pytest.raises(ValueError, match="loopback"):
+        ag.launcher_api_base()
+
+
+def test_15aa_launcher_uses_a_separate_management_token(conf, monkeypatch):
+    monkeypatch.setenv("PICO_TOKEN", "pico-channel-token")
+    monkeypatch.delenv("LAUNCHER_TOKEN", raising=False)
+    monkeypatch.setattr(ag, "_pico_security_token", lambda: "")
+    assert ag.launcher_token() == "pico-channel-token"
+
+    monkeypatch.setenv("LAUNCHER_TOKEN", "launcher-management-token")
+    assert ag.launcher_token() == "launcher-management-token"
+
+
+def test_15_control_request_is_correlated_and_requires_confirmation(conf, monkeypatch):
+    agent = ag.Agent()
+    captured = []
+    calls = []
+
+    async def capture(obj):
+        captured.append(obj)
+
+    def fake_launcher(method, path, body=None, multipart=None, timeout=35.0):
+        calls.append((method, path, body, multipart))
+        return 200, {"models": [{"model_name": "safe-model"}]}
+
+    monkeypatch.setattr(agent, "send_to_app", capture)
+    monkeypatch.setattr(ag, "launcher_control_request", fake_launcher)
+    asyncio.run(
+        agent.handle_relay_message(
+            json.dumps(
+                {
+                    "type": "control.request",
+                    "id": "control-envelope",
+                    "session_id": "session-control-test",
+                    "payload": {
+                        "request_id": "control-123",
+                        "method": "GET",
+                        "path": "/api/models",
+                    },
+                }
+            )
+        )
+    )
+    assert calls == [("GET", "/api/models", None, None)]
+    assert captured[-1]["type"] == "control.response"
+    assert captured[-1]["payload"]["request_id"] == "control-123"
+    assert captured[-1]["payload"]["ok"] is True
+
+    asyncio.run(
+        agent.handle_relay_message(
+            json.dumps(
+                {
+                    "type": "control.request",
+                    "session_id": "session-control-test",
+                    "payload": {
+                        "request_id": "delete-123",
+                        "method": "DELETE",
+                        "path": "/api/models/safe-model",
+                    },
+                }
+            )
+        )
+    )
+    assert captured[-1]["payload"]["status"] == 409
+    assert captured[-1]["payload"]["error"] == "confirmation_required"
+    assert len(calls) == 1
+
+
+def test_15b_relay_storage_error_keeps_file_and_enables_retry(conf):
+    agent = ag.Agent()
+    transfer_id = "12345678-1234-1234-1234-123456789012"
+    outbox = Path(agent._outbox_dir())
+    outbox.mkdir(parents=True, exist_ok=True)
+    data_path = outbox / f"{transfer_id}.bin"
+    meta_path = outbox / f"{transfer_id}.json"
+    data_path.write_bytes(b"docx")
+    meta_path.write_text(
+        json.dumps(
+            {
+                "transfer_id": transfer_id,
+                "session_id": "session-storage-retry",
+                "name": "test.docx",
+                "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "last_sent_at": int(time.time()),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    asyncio.run(
+        agent.handle_relay_message(
+            json.dumps(
+                {
+                    "type": "relay.storage_error",
+                    "session_id": "session-storage-retry",
+                    "payload": {
+                        "kind": "file",
+                        "transfer_id": transfer_id,
+                    },
+                }
+            )
+        )
+    )
+
+    assert data_path.is_file()
+    assert meta_path.is_file()
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["last_sent_at"] == 0
+
+
 def test_16_scheduled_tasks_reads_picoclaw_jobs(conf, monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     cron = workspace / "cron"
@@ -641,6 +785,192 @@ def test_20b_send_file_resends_older_pico_sanitized_document(
     assert pushed[0][1] == str(generated.resolve())
 
 
+def test_20c_scheduled_attachment_false_failure_is_reconciled_once(
+    conf, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    cron = workspace / "cron"
+    inbox = workspace / "inbox"
+    sessions = workspace / "sessions"
+    cron.mkdir(parents=True)
+    inbox.mkdir()
+    sessions.mkdir()
+    (cron / "runs.json").write_text(
+        json.dumps({"version": 1, "runs": []}),
+        encoding="utf-8",
+    )
+    (cron / "jobs.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "jobs": [
+                    {
+                        "id": "scheduled-doc-job",
+                        "state": {
+                            "lastStatus": "error",
+                            "lastError": "scheduled agent task returned an empty response",
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PICO_WORKSPACE", str(workspace))
+    agent = ag.Agent()
+
+    message = "Create and deliver the scheduled Word file."
+    generated = inbox / "scheduled-report.docx"
+    generated.write_bytes(b"PK-scheduled-docx")
+    modified_ms = int(generated.stat().st_mtime * 1000)
+    (sessions / "agent_main_cron_scheduled-doc-job.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"role": "user", "content": message}),
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "generate_document",
+                                    "arguments": json.dumps(
+                                        {"filename": "scheduled-report.docx"}
+                                    ),
+                                }
+                            }
+                        ],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "content": "📎 附件：scheduled-report.docx\n路径：scheduled-report.docx",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (cron / "runs.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "runs": [
+                    {
+                        "run_id": "scheduled-run-001",
+                        "job_id": "scheduled-doc-job",
+                        "status": "error",
+                        "error": "scheduled agent task returned an empty response",
+                        "started_at_ms": modified_ms - 1000,
+                        "finished_at_ms": modified_ms + 1000,
+                        "message": message,
+                        "to": "pico:session-scheduled-001",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pushed = []
+
+    async def capture(sid, path, name, mime):
+        pushed.append((sid, path, name, mime))
+
+    monkeypatch.setattr(agent, "_push_local_file_to_app", capture)
+    assert asyncio.run(agent._reconcile_scheduled_runs_once()) == 1
+    assert len(pushed) == 1
+    assert pushed[0][0] == "session-scheduled-001"
+    assert pushed[0][2] == "scheduled-report.docx"
+    assert asyncio.run(agent._reconcile_scheduled_runs_once()) == 0
+    assert len(pushed) == 1
+
+    run = json.loads((cron / "runs.json").read_text(encoding="utf-8"))["runs"][0]
+    assert run["status"] == "ok"
+    assert run["delivery_status"] == "delivered"
+    assert "error" not in run
+    job_state = json.loads((cron / "jobs.json").read_text(encoding="utf-8"))["jobs"][0]["state"]
+    assert job_state["lastStatus"] == "ok"
+    assert "lastError" not in job_state
+    ledger = json.loads((conf / "scheduled-delivery.json").read_text(encoding="utf-8"))
+    assert "scheduled-run-001" in ledger["run_ids"]
+
+
+def test_20d_scheduled_false_failure_waits_for_run_record(conf, monkeypatch):
+    agent = ag.Agent()
+    session_id = "session-scheduled-delay"
+    attempts = 0
+    forwarded = []
+
+    async def delayed_reconcile():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            agent._recent_scheduled_delivery[session_id] = time.time()
+        return 1 if attempts == 2 else 0
+
+    async def capture(obj):
+        forwarded.append(obj)
+
+    monkeypatch.setattr(agent, "_reconcile_scheduled_runs_once", delayed_reconcile)
+    monkeypatch.setattr(agent, "send_to_app", capture)
+    asyncio.run(
+        agent.handle_pico_message(
+            session_id,
+            json.dumps(
+                {
+                    "type": "message.create",
+                    "id": "scheduled-failure-message",
+                    "session_id": session_id,
+                    "payload": {
+                        "content": "Scheduled task failed: the agent returned no response"
+                    },
+                }
+            ),
+        )
+    )
+    assert attempts == 2
+    assert forwarded == []
+
+
+def test_20e_real_scheduled_empty_response_is_translated_to_chinese(
+    conf, monkeypatch
+):
+    agent = ag.Agent()
+    forwarded = []
+
+    async def not_reconciled(_session_id, timeout=4.0):
+        return False
+
+    async def capture(obj):
+        forwarded.append(obj)
+
+    monkeypatch.setattr(
+        agent, "_scheduled_failure_was_reconciled", not_reconciled
+    )
+    monkeypatch.setattr(agent, "send_to_app", capture)
+    asyncio.run(
+        agent.handle_pico_message(
+            "session-real-scheduled-failure",
+            json.dumps(
+                {
+                    "type": "message.create",
+                    "id": "real-scheduled-failure-message",
+                    "payload": {
+                        "content": "Scheduled task failed: the agent returned no response"
+                    },
+                }
+            ),
+        )
+    )
+    assert len(forwarded) >= 1
+    message = next(item for item in forwarded if item.get("type") == "message.create")
+    assert message["payload"]["content"] == ag.SCHEDULED_FAILURE_MESSAGE_ZH
+    assert "Scheduled task failed" not in json.dumps(message, ensure_ascii=False)
+
+
 def test_21_send_file_still_rejects_unapproved_path(conf, monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -713,3 +1043,58 @@ def test_23_outbox_retention_is_thirty_days(conf, tmp_path):
         os.utime(path, (expired_time, expired_time))
     agent._cleanup_outbox()
     assert not any(path.exists() for path in paths)
+
+
+def test_24_launcher_control_reuses_one_session_for_concurrent_requests(
+    conf, monkeypatch
+):
+    monkeypatch.setenv("LAUNCHER_TOKEN", "launcher-test-token")
+    monkeypatch.setenv("LAUNCHER_API_BASE", "http://127.0.0.1:18880")
+    calls = {"login": 0, "request": 0}
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __init__(self, body):
+            self.body = json.dumps(body).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit=-1):
+            return self.body
+
+    class Opener:
+        def open(self, request, timeout=0):
+            if request.full_url.endswith("/api/auth/login"):
+                calls["login"] += 1
+                return Response({"ok": True})
+            calls["request"] += 1
+            return Response({"ok": True, "path": request.full_url})
+
+    monkeypatch.setattr(ag, "build_opener", lambda *_args: Opener())
+    results = []
+
+    def invoke(path):
+        results.append(ag.launcher_control_request("GET", path))
+
+    threads = [
+        threading.Thread(target=invoke, args=(path,))
+        for path in (
+            "/api/monitor/performance",
+            "/api/usage/stats?days=30",
+            "/api/monitor/logs",
+        )
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert calls == {"login": 1, "request": 3}
+    assert len(results) == 3
+    assert all(status == 200 and body["ok"] for status, body in results)
