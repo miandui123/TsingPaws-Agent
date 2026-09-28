@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tar.gz
+.env
+telegram-bots.json
+install-state

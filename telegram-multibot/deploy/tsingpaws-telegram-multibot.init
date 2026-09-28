@@ -1,0 +1,49 @@
+#!/bin/sh /etc/rc.common
+
+START=98
+STOP=11
+USE_PROCD=1
+
+PROG=/usr/bin/python3
+SCRIPT=/opt/tsingpaw/extensions/telegram-multibot/telegram_multibot_adapter.py
+CONFIG=/opt/tsingpaw/data/telegram-bots.json
+
+start_service() {
+	[ -x "$PROG" ] || {
+		logger -t tsingpaws-telegram-multibot "ERROR: missing $PROG"
+		return 1
+	}
+	[ -r "$SCRIPT" ] || {
+		logger -t tsingpaws-telegram-multibot "ERROR: missing $SCRIPT"
+		return 1
+	}
+	[ -r "$CONFIG" ] || {
+		logger -t tsingpaws-telegram-multibot "ERROR: missing $CONFIG"
+		return 1
+	}
+
+	procd_open_instance
+	procd_set_param command "$PROG" -u "$SCRIPT"
+	procd_set_param env \
+		TELEGRAM_MULTIBOT_HOST="127.0.0.1" \
+		TELEGRAM_MULTIBOT_PORT="18792" \
+		TELEGRAM_MULTIBOT_CONFIG="$CONFIG" \
+		PICO_BASE_URL="ws://127.0.0.1:18880" \
+		PICO_WS_PATH="/pico/ws" \
+		PICO_VIA_LAUNCHER="1" \
+		PICO_LAUNCHER_CONFIG="/opt/tsingpaw/data/launcher-config.json" \
+		PICO_SECURITY_FILE="/opt/tsingpaw/data/.security.yml" \
+		PICO_PID_FILE="/opt/tsingpaw/data/.picoclaw.pid" \
+		PYTHONUNBUFFERED="1"
+	procd_set_param file "$SCRIPT" "$CONFIG" /opt/tsingpaw/data/.security.yml
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/tsingpaws-telegram-multibot.pid
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}
