@@ -200,6 +200,36 @@ def rewrite_public_urls(raw: bytes, host_header: str) -> bytes:
     return text.encode("utf-8")
 
 
+def rewrite_upstream_browser_headers(headers: Dict[str, str], upstream) -> Dict[str, str]:
+    """Align browser security headers with the loopback Launcher origin.
+
+    A remote browser legitimately sends Origin/Referer for DEVICE_IP:18800.
+    The bridge connects to 127.0.0.1:18880, so forwarding those values
+    unchanged makes Launcher versions with origin checks reject login as CSRF.
+    """
+    port = upstream.port or (443 if upstream.scheme == "https" else 80)
+    default_port = (upstream.scheme == "http" and port == 80) or (
+        upstream.scheme == "https" and port == 443
+    )
+    authority = upstream.hostname if default_port else f"{upstream.hostname}:{port}"
+    origin = f"{upstream.scheme}://{authority}"
+    rewritten = dict(headers)
+    for key in list(rewritten):
+        lower = key.lower()
+        if lower == "origin":
+            rewritten[key] = origin
+        elif lower == "referer":
+            try:
+                source = urlsplit(rewritten[key])
+                suffix = source.path or "/"
+                if source.query:
+                    suffix += "?" + source.query
+            except Exception:
+                suffix = "/"
+            rewritten[key] = origin + suffix
+    return rewritten
+
+
 def redact(text: str) -> str:
     out = text or ""
     out = re.sub(r"(?i)(token|authorization|bearer|password|secret)=([^&\s]+)", r"\1=***", out)
@@ -1122,6 +1152,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if k.lower() in HOP_BY_HOP:
                 continue
             headers[k] = v
+        headers = rewrite_upstream_browser_headers(headers, upstream)
         headers["Host"] = f"{upstream.hostname}:{upstream.port or 80}"
         headers["Connection"] = "close"
         try:

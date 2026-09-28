@@ -14,12 +14,37 @@ class QuietHandler(BaseHTTPRequestHandler):
 
 
 class LauncherHandler(QuietHandler):
+    last_login_headers = {}
+
     def do_GET(self):
         if self.path == "/api/auth/status":
             authenticated = "launcher_session=ok" in (self.headers.get("Cookie") or "")
             body = json.dumps({"authenticated": authenticated}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/api/auth/login":
+            expected = f"http://127.0.0.1:{self.server.server_port}"
+            self.__class__.last_login_headers = dict(self.headers.items())
+            if self.headers.get("Origin") != expected:
+                self.send_error(403)
+                return
+            referer = self.headers.get("Referer")
+            if referer and not referer.startswith(expected + "/"):
+                self.send_error(403)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", "launcher_session=ok; Path=/; HttpOnly; SameSite=Lax")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -77,9 +102,9 @@ class MultibotBridgeTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
-    def request(self, method, path, *, auth=True, origin=True, body=None):
+    def request(self, method, path, *, auth=True, origin=True, body=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.bridge.server_port, timeout=3)
-        headers = {}
+        headers = dict(headers or {})
         if auth:
             headers["Cookie"] = "launcher_session=ok"
         if origin:
@@ -92,6 +117,28 @@ class MultibotBridgeTest(unittest.TestCase):
         payload = response.read()
         conn.close()
         return response.status, payload
+
+    def test_remote_login_origin_is_rewritten_for_launcher(self):
+        remote_origin = "http://192.168.0.20:18800"
+        status, _payload = self.request(
+            "POST",
+            "/api/auth/login",
+            auth=False,
+            origin=False,
+            body={"token": "test-only"},
+            headers={
+                "Host": "192.168.0.20:18800",
+                "Origin": remote_origin,
+                "Referer": remote_origin + "/login?next=%2F",
+            },
+        )
+        self.assertEqual(200, status)
+        expected = f"http://127.0.0.1:{self.launcher.server_port}"
+        self.assertEqual(expected, LauncherHandler.last_login_headers.get("Origin"))
+        self.assertEqual(
+            expected + "/login?next=%2F",
+            LauncherHandler.last_login_headers.get("Referer"),
+        )
 
     def test_list_requires_launcher_auth(self):
         self.assertEqual(401, self.request("GET", "/api/telegram-bots", auth=False)[0])

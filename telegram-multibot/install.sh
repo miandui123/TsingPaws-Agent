@@ -5,10 +5,10 @@
 
 set -eu
 
-VERSION=v0.1.0
+VERSION=v0.1.1
 RAW_BASE="https://raw.githubusercontent.com/miandui123/TsingPaws-Telegram-Multibot/$VERSION"
 MANIFEST=checksums-runtime.sha256
-MANIFEST_SHA256=cae54e19f72ae134dd1175800edc80c5f30b06850590916e9c2e380f4f49e860
+MANIFEST_SHA256=dc83f3ecad8e12b34419fa31efc4eae110b4255eeb2db0f29fe7967a2fe9a8f0
 
 say() { printf '%s\n' "tsingpaws-multibot bootstrap: $*"; }
 die() { say "ERROR: $*" >&2; exit 1; }
