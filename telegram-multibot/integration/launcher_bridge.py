@@ -1167,8 +1167,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 inject = (
                     b'<link rel="stylesheet" href="/tsingpaws-cloud/skill-library.css?v=4" />'
                     b'<script src="/tsingpaws-cloud/skill-library.js?v=4" defer></script>'
-                    b'<link rel="stylesheet" href="/tsingpaws-cloud/telegram-multibot.css?v=1" />'
-                    b'<script src="/tsingpaws-cloud/telegram-multibot.js?v=1" defer></script>'
+                    b'<link rel="stylesheet" href="/tsingpaws-cloud/telegram-multibot.css?v=2" />'
+                    b'<script src="/tsingpaws-cloud/telegram-multibot.js?v=2" defer></script>'
                 )
                 raw_l = raw.lower()
                 idx = raw_l.rfind(b"</body>")

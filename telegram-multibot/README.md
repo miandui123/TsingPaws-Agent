@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/miandui123/TsingPaws-Telegram-Multi
 wget -qO- https://raw.githubusercontent.com/miandui123/TsingPaws-Telegram-Multibot/main/install.sh | sh
 ```
 
-引导脚本固定安装 `v0.1.1`，下载前校验清单 SHA-256，下载后逐个校验程序文件。安装失败会自动恢复安装前的文件和服务状态。
+引导脚本固定安装 `v0.1.2`，下载前校验清单 SHA-256，下载后逐个校验程序文件。安装失败会自动恢复安装前的文件和服务状态。
 
 ## 前提
 

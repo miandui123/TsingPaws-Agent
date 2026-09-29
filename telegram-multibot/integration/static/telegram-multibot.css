@@ -13,7 +13,14 @@
 
 [data-tp-tg-hidden="1"] { display: none !important; }
 
-.tp-tg-host { background: #f6f8fb; }
+.tp-tg-host {
+  min-height: 0 !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+  background: #f6f8fb;
+}
 .tp-tg-root { width: min(1120px, calc(100% - 40px)); margin: 0 auto; padding: 30px 0 56px; color: var(--tp-tg-ink); }
 .tp-tg-hero { display: flex; align-items: center; gap: 18px; padding: 26px 28px; background: linear-gradient(135deg, #fff 0%, #f2faff 100%); border: 1px solid #dceaf4; border-radius: 18px; box-shadow: 0 10px 30px rgba(31, 79, 110, .07); }
 .tp-tg-hero-icon, .tp-tg-avatar, .tp-tg-empty-icon { display: grid; place-items: center; flex: 0 0 auto; background: var(--tp-tg-blue); color: #fff; }

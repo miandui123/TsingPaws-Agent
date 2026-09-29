@@ -161,6 +161,15 @@ class MultibotBridgeTest(unittest.TestCase):
         self.assertIn("PUT", methods)
         self.assertIn("DELETE", methods)
 
+    def test_multibot_page_assets_enable_long_list_scrolling(self):
+        integration_dir = Path(__file__).resolve().parents[1]
+        css = (integration_dir / "static" / "telegram-multibot.css").read_text(encoding="utf-8")
+        bridge = (integration_dir / "launcher_bridge.py").read_text(encoding="utf-8")
+        self.assertIn("overflow-y: auto !important", css)
+        self.assertIn("min-height: 0 !important", css)
+        self.assertIn("telegram-multibot.css?v=2", bridge)
+        self.assertIn("telegram-multibot.js?v=2", bridge)
+
 
 if __name__ == "__main__":
     unittest.main()
